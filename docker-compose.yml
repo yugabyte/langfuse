@@ -262,6 +262,64 @@ services:
       retries: 15
       start_period: 180s
 
+  yb-tracing-schema-init:
+    image: yugabytedb/yugabyte:2025.2.1.0-b141
+    depends_on:
+      yugabyte-db:
+        condition: service_healthy
+      yb-metadata-schema-init:
+        condition: service_completed_successfully
+    command: >
+      bash -eu -o pipefail -c '
+        YSQL="./bin/ysqlsh -h yugabyte-db -p 5433 -U yugabyte"
+        PG_READY="/home/yugabyte/postgres/bin/pg_isready -h yugabyte-db -p 5433 -U yugabyte"
+
+        until $$PG_READY -d yugabyte; do sleep 10; done
+
+        db_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='\''langfuse'\''" | tr -d "[:space:]")"
+        if [ "$$db_exists" != "1" ]; then
+          $$YSQL -d yugabyte -c "CREATE DATABASE langfuse"
+        fi
+
+        $$YSQL -d langfuse -c "CREATE SCHEMA IF NOT EXISTS clickhouse"
+        PGOPTIONS="-c search_path=clickhouse,public" \
+          $$YSQL -d langfuse -f /schema/tracing_postgres_schema.sql
+      '
+    volumes:
+      - ./tracing_postgres_schema.sql:/schema/tracing_postgres_schema.sql:ro
+    restart: "no"
+
+  yb-metadata-schema-init:
+    image: yugabytedb/yugabyte:2025.2.1.0-b141
+    depends_on:
+      yugabyte-db:
+        condition: service_healthy
+    command: >
+      bash -eu -o pipefail -c '
+        YSQL="./bin/ysqlsh -h yugabyte-db -p 5433 -U yugabyte"
+        PG_READY="/home/yugabyte/postgres/bin/pg_isready -h yugabyte-db -p 5433 -U yugabyte"
+
+        until $$PG_READY -d yugabyte; do sleep 10; done
+
+        # Create ybvoyager role if it does not exist
+        role_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_roles WHERE rolname='\''ybvoyager'\''" | tr -d "[:space:]")"
+        if [ "$$role_exists" != "1" ]; then
+          $$YSQL -d yugabyte -c "CREATE ROLE ybvoyager"
+        fi
+
+        db_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='\''langfuse'\''" | tr -d "[:space:]")"
+        if [ "$$db_exists" != "1" ]; then
+          # First-time setup: create metadata DB and load yb_postgres_data.sql.
+          $$YSQL -d yugabyte -c "CREATE DATABASE langfuse"
+          $$YSQL -d langfuse -v ON_ERROR_STOP=1 -f /schema/yb_postgres_data.sql
+        else
+          echo "Database langfuse already exists; skipping yb_postgres_data.sql import."
+        fi
+      '
+    volumes:
+      - ./yb_postgres_data.sql:/schema/yb_postgres_data.sql:ro
+    restart: "no"
+
   minio:
     image: cgr.dev/chainguard/minio
     restart: always
