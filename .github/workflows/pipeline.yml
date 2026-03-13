@@ -8,9 +8,7 @@ on:
     tags:
       - "v*"
   merge_group:
-  pull_request:
-    branches:
-      - "**"
+  # Disabled on pull_request so PRs only run dedicated API e2e workflow.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
