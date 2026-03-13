@@ -1,6 +1,7 @@
 name: PR Open API E2E
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - "**"
@@ -8,6 +9,7 @@ on:
       - opened
       - reopened
       - ready_for_review
+      - synchronize
 
 concurrency:
   group: pr-open-api-e2e-${{ github.event.pull_request.number }}
