@@ -14,8 +14,7 @@ name: "CodeQL"
 on:
   push:
     branches: ["main", "production", "v*"]
-  pull_request:
-    branches: ["main", "production", "v*"]
+  # pull_request trigger disabled so only PR Open API E2E runs on PRs.
   schedule:
     - cron: "31 13 * * 0"
 

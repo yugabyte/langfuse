@@ -7,9 +7,7 @@ on:
       - "main"
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - "**"
+  # pull_request trigger disabled so only PR Open API E2E runs on PRs.
   merge_group:
 
 permissions:

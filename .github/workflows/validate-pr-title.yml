@@ -2,14 +2,8 @@
 name: "Validate PR Title"
 
 on:
-  pull_request:
-    branches:
-      - "**"
-    types:
-      - opened
-      - edited
-      - synchronize
-      - reopened
+  # pull_request trigger disabled so only PR Open API E2E runs on PRs.
+  workflow_dispatch:
 
 jobs:
   validate-pr-title:
