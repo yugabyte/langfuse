@@ -1,0 +1,73 @@
+name: PR Open API E2E
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+concurrency:
+  group: pr-open-api-e2e-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  api-e2e-flow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set deterministic bootstrap keys for tests
+        run: |
+          echo "LANGFUSE_HOST=http://localhost:3000" >> "$GITHUB_ENV"
+          echo "LANGFUSE_PUBLIC_KEY=pk-lf-local-tracing-project" >> "$GITHUB_ENV"
+          echo "LANGFUSE_SECRET_KEY=sk-lf-local-tracing-project-secret" >> "$GITHUB_ENV"
+          echo "LANGFUSE_E2E_TIMEOUT_SECONDS=60" >> "$GITHUB_ENV"
+
+      - name: Build and start stack from docker-compose.yml
+        run: |
+          docker compose -f docker-compose.yml up -d --build --wait --wait-timeout 360
+
+      - name: Wait for web and worker health endpoints
+        run: |
+          curl --retry 30 --retry-delay 2 --retry-all-errors --silent --show-error --fail \
+            http://localhost:3000/api/public/health
+          curl --retry 30 --retry-delay 2 --retry-all-errors --silent --show-error --fail \
+            http://localhost:3030/api/health
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run basic API flow e2e tests
+        run: |
+          python -m pytest tests/e2e/test_public_ingestion_api.py -k "basic_flow or ingestion_accepts_valid_batch" -q
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml ps
+          docker compose -f docker-compose.yml logs --no-color > /tmp/pr-open-api-e2e.log || true
+
+      - name: Upload compose logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-open-api-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/pr-open-api-e2e.log
+          if-no-files-found: ignore
+
+      - name: Shutdown compose stack
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml down -v
