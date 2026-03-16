@@ -119,97 +119,16 @@ SET default_table_access_method = heap;
 -- Name: observations_2026_03; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.observations_2026_03 (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    trace_id text NOT NULL,
-    parent_observation_id text,
-    environment text,
-    type public.observation_type NOT NULL,
-    name text NOT NULL,
-    start_time timestamp with time zone NOT NULL,
-    end_time timestamp with time zone,
-    level public.observation_level DEFAULT 'DEFAULT'::public.observation_level NOT NULL,
-    status_message text,
-    version text,
-    input text,
-    output text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    provided_model_name text,
-    internal_model_id text,
-    model_parameters jsonb,
-    provided_usage_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    usage_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    provided_cost_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    cost_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    total_cost numeric(18,12),
-    usage_pricing_tier_id text,
-    usage_pricing_tier_name text,
-    completion_start_time timestamp with time zone,
-    prompt_id text,
-    prompt_name text,
-    prompt_version integer,
-    tool_definitions jsonb DEFAULT '{}'::jsonb NOT NULL,
-    tool_calls jsonb DEFAULT '[]'::jsonb NOT NULL,
-    tool_call_names text[] DEFAULT '{}'::text[] NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT observations_2026_03_pkey PRIMARY KEY((project_id) HASH, id ASC, start_time ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.observations_2026_03 OWNER TO yugabyte;
+CREATE TABLE IF NOT EXISTS public.observations_2026_03
+  PARTITION OF public.observations
+  FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
 
 --
 -- Name: observations_default; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.observations_default (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    trace_id text NOT NULL,
-    parent_observation_id text,
-    environment text,
-    type public.observation_type NOT NULL,
-    name text NOT NULL,
-    start_time timestamp with time zone NOT NULL,
-    end_time timestamp with time zone,
-    level public.observation_level DEFAULT 'DEFAULT'::public.observation_level NOT NULL,
-    status_message text,
-    version text,
-    input text,
-    output text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    provided_model_name text,
-    internal_model_id text,
-    model_parameters jsonb,
-    provided_usage_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    usage_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    provided_cost_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    cost_details jsonb DEFAULT '{}'::jsonb NOT NULL,
-    total_cost numeric(18,12),
-    usage_pricing_tier_id text,
-    usage_pricing_tier_name text,
-    completion_start_time timestamp with time zone,
-    prompt_id text,
-    prompt_name text,
-    prompt_version integer,
-    tool_definitions jsonb DEFAULT '{}'::jsonb NOT NULL,
-    tool_calls jsonb DEFAULT '[]'::jsonb NOT NULL,
-    tool_call_names text[] DEFAULT '{}'::text[] NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT observations_default_pkey PRIMARY KEY((project_id) HASH, id ASC, start_time ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.observations_default OWNER TO yugabyte;
+CREATE TABLE IF NOT EXISTS public.observations_default
+  PARTITION OF public.observations DEFAULT;
 
 --
 -- Name: scores; Type: TABLE; Schema: public; Owner: yugabyte
@@ -251,73 +170,16 @@ ALTER TABLE public.scores OWNER TO yugabyte;
 -- Name: scores_2026_03; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.scores_2026_03 (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    "timestamp" timestamp with time zone NOT NULL,
-    trace_id text NOT NULL,
-    observation_id text,
-    session_id text,
-    dataset_run_id text,
-    environment text,
-    name text NOT NULL,
-    value double precision,
-    string_value text,
-    long_string_value text,
-    data_type public.score_data_type NOT NULL,
-    source text,
-    comment text,
-    author_user_id text,
-    config_id text,
-    queue_id text,
-    execution_trace_id text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT scores_2026_03_pkey PRIMARY KEY((project_id) HASH, id ASC, "timestamp" ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.scores_2026_03 OWNER TO yugabyte;
+CREATE TABLE IF NOT EXISTS public.scores_2026_03
+  PARTITION OF public.scores
+  FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
 
 --
 -- Name: scores_default; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.scores_default (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    "timestamp" timestamp with time zone NOT NULL,
-    trace_id text NOT NULL,
-    observation_id text,
-    session_id text,
-    dataset_run_id text,
-    environment text,
-    name text NOT NULL,
-    value double precision,
-    string_value text,
-    long_string_value text,
-    data_type public.score_data_type NOT NULL,
-    source text,
-    comment text,
-    author_user_id text,
-    config_id text,
-    queue_id text,
-    execution_trace_id text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT scores_default_pkey PRIMARY KEY((project_id) HASH, id ASC, "timestamp" ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.scores_default OWNER TO yugabyte;
+CREATE TABLE IF NOT EXISTS public.scores_default
+  PARTITION OF public.scores DEFAULT;
 
 --
 -- Name: traces; Type: TABLE; Schema: public; Owner: yugabyte
@@ -354,105 +216,16 @@ ALTER TABLE public.traces OWNER TO yugabyte;
 -- Name: traces_2026_03; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.traces_2026_03 (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    "timestamp" timestamp with time zone NOT NULL,
-    name text,
-    user_id text,
-    session_id text,
-    environment text,
-    public boolean DEFAULT false NOT NULL,
-    bookmarked boolean DEFAULT false NOT NULL,
-    tags text[] DEFAULT '{}'::text[] NOT NULL,
-    input text,
-    output text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    release text,
-    version text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT traces_2026_03_pkey PRIMARY KEY((project_id) HASH, id ASC, "timestamp" ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.traces_2026_03 OWNER TO yugabyte;
+CREATE TABLE IF NOT EXISTS public.traces_2026_03
+  PARTITION OF public.traces
+  FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
 
 --
 -- Name: traces_default; Type: TABLE; Schema: public; Owner: yugabyte
 --
 
-CREATE TABLE public.traces_default (
-    id text NOT NULL,
-    project_id text NOT NULL,
-    "timestamp" timestamp with time zone NOT NULL,
-    name text,
-    user_id text,
-    session_id text,
-    environment text,
-    public boolean DEFAULT false NOT NULL,
-    bookmarked boolean DEFAULT false NOT NULL,
-    tags text[] DEFAULT '{}'::text[] NOT NULL,
-    input text,
-    output text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    release text,
-    version text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_ts timestamp with time zone DEFAULT now() NOT NULL,
-    is_deleted boolean DEFAULT false NOT NULL,
-    CONSTRAINT traces_default_pkey PRIMARY KEY((project_id) HASH, id ASC, "timestamp" ASC)
-)
-WITH (colocation='false');
-
-
-ALTER TABLE public.traces_default OWNER TO yugabyte;
-
---
--- Name: observations_2026_03; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.observations ATTACH PARTITION public.observations_2026_03 FOR VALUES FROM ('2026-03-01 05:30:00+05:30') TO ('2026-04-01 05:30:00+05:30');
-
-
---
--- Name: observations_default; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.observations ATTACH PARTITION public.observations_default DEFAULT;
-
-
---
--- Name: scores_2026_03; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.scores ATTACH PARTITION public.scores_2026_03 FOR VALUES FROM ('2026-03-01 05:30:00+05:30') TO ('2026-04-01 05:30:00+05:30');
-
-
---
--- Name: scores_default; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.scores ATTACH PARTITION public.scores_default DEFAULT;
-
-
---
--- Name: traces_2026_03; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.traces ATTACH PARTITION public.traces_2026_03 FOR VALUES FROM ('2026-03-01 05:30:00+05:30') TO ('2026-04-01 05:30:00+05:30');
-
-
---
--- Name: traces_default; Type: TABLE ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER TABLE ONLY public.traces ATTACH PARTITION public.traces_default DEFAULT;
-
+CREATE TABLE IF NOT EXISTS public.traces_default
+  PARTITION OF public.traces DEFAULT;
 
 --
 -- Data for Name: observations_2026_03; Type: TABLE DATA; Schema: public; Owner: yugabyte
@@ -500,48 +273,6 @@ COPY public.traces_2026_03 (id, project_id, "timestamp", name, user_id, session_
 
 COPY public.traces_default (id, project_id, "timestamp", name, user_id, session_id, environment, public, bookmarked, tags, input, output, metadata, release, version, created_at, updated_at, event_ts, is_deleted) FROM stdin;
 \.
-
-
---
--- Name: observations_2026_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.observations_pkey ATTACH PARTITION public.observations_2026_03_pkey;
-
-
---
--- Name: observations_default_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.observations_pkey ATTACH PARTITION public.observations_default_pkey;
-
-
---
--- Name: scores_2026_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.scores_pkey ATTACH PARTITION public.scores_2026_03_pkey;
-
-
---
--- Name: scores_default_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.scores_pkey ATTACH PARTITION public.scores_default_pkey;
-
-
---
--- Name: traces_2026_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.traces_pkey ATTACH PARTITION public.traces_2026_03_pkey;
-
-
---
--- Name: traces_default_pkey; Type: INDEX ATTACH; Schema: public; Owner: yugabyte
---
-
-ALTER INDEX public.traces_pkey ATTACH PARTITION public.traces_default_pkey;
 
 
 --
