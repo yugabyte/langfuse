@@ -242,12 +242,13 @@ export const env = createEnv({
       ),
 
     // clickhouse
-    CLICKHOUSE_URL: z.string().url(),
+    // Defaulted so self-hosters can run without explicitly wiring ClickHouse env vars.
+    CLICKHOUSE_URL: z.string().url().default("http://127.0.0.1:8123"),
     CLICKHOUSE_CLUSTER_NAME: z.string().default("default"),
     CLICKHOUSE_DB: z.string().default("default"),
-    CLICKHOUSE_USER: z.string(),
-    CLICKHOUSE_PASSWORD: z.string(),
-    CLICKHOUSE_CLUSTER_ENABLED: z.enum(["true", "false"]).default("true"),
+    CLICKHOUSE_USER: z.string().default("clickhouse"),
+    CLICKHOUSE_PASSWORD: z.string().default("clickhouse"),
+    CLICKHOUSE_CLUSTER_ENABLED: z.enum(["true", "false"]).default("false"),
     CLICKHOUSE_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY: z.coerce
       .number()
       .default(32_000_000_000), // ~32GB
