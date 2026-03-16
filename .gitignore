@@ -20,7 +20,8 @@ migrate
 /.next-check/
 /out/
 next-env.d.ts
-
+.venv*
+__pycache__/
 # production
 /build
 
