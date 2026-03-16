@@ -29,29 +29,12 @@ services:
         condition: service_completed_successfully
       yb-tracing-schema-init:
         condition: service_completed_successfully
-      # postgres-tracing:
-      #   condition: service_healthy
-      # postgres-tracing-schema-init:
-      #   condition: service_completed_successfully
     ports:
       - "${WEB_HOST_PORT:-3000}:3000"
     environment:
       # Metadata DB (Prisma migrations + metadata tables)
       DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
       TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse?schema=clickhouse"
-      # DIRECT_URL: "postgresql://postgres:postgres@${POSTGRES_CONTAINER_NAME:-langfuse-postgres}:5432/postgres"
-      # Tracing DB (traces/observations/scores repositories)
-      # Container -> host DB on macOS/Windows:
-      # jdbc:postgresql://host.docker.internal:5433/yugabyte?user=yugabyte&password=yugabyte
-      # TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@host.docker.internal:5433/langfuse"
-      # TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
-
-      # ClickHouse (kept for env compatibility; tracing repositories use Postgres)
-      CLICKHOUSE_MIGRATION_URL: "clickhouse://${CLICKHOUSE_CONTAINER_NAME:-langfuse-clickhouse}:9000"
-      CLICKHOUSE_URL: "http://${CLICKHOUSE_CONTAINER_NAME:-langfuse-clickhouse}:8123"
-      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-clickhouse}"
-      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-clickhouse}"
-      CLICKHOUSE_CLUSTER_ENABLED: "false"
 
       # Redis
       REDIS_HOST: "redis"
@@ -118,8 +101,6 @@ services:
       LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED: "${LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED:-false}"
       LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED: "${LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED:-false}"
       LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED: "${LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED:-false}"
-    networks:
-      - default
 
   langfuse-worker:
     image: langfuse-worker:local
@@ -135,10 +116,6 @@ services:
         condition: service_completed_successfully
       yb-tracing-schema-init:
         condition: service_completed_successfully
-      # postgres-tracing:
-      #   condition: service_healthy
-      # postgres-tracing-schema-init:
-      #   condition: service_completed_successfully
       redis:
         condition: service_started
       minio:
@@ -151,18 +128,6 @@ services:
       # Metadata DB
       DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
       TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse?schema=clickhouse"
-      # DATABASE_URL: "postgresql://postgres:postgres@${POSTGRES_CONTAINER_NAME:-langfuse-postgres}:5432/postgres"
-      # Tracing DB (traces/observations/scores repositories)
-      # TRACING_DATABASE_URL: "postgresql://postgres:postgres@${TRACING_POSTGRES_CONTAINER_NAME:-langfuse-postgres-tracing}:5432/postgres"
-      # TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@host.docker.internal:5433/langfuse"
-      # TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
-
-      # ClickHouse (kept for env compatibility; tracing repositories use Postgres)
-      CLICKHOUSE_MIGRATION_URL: "clickhouse://${CLICKHOUSE_CONTAINER_NAME:-langfuse-clickhouse}:9000"
-      CLICKHOUSE_URL: "http://${CLICKHOUSE_CONTAINER_NAME:-langfuse-clickhouse}:8123"
-      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-clickhouse}"
-      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-clickhouse}"
-      CLICKHOUSE_CLUSTER_ENABLED: "false"
 
       # Redis
       REDIS_HOST: "redis"
@@ -210,8 +175,6 @@ services:
       LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED: "${LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED:-false}"
       QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED: "${QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED:-true}"
       QUEUE_CONSUMER_OTEL_INGESTION_QUEUE_IS_ENABLED: "${QUEUE_CONSUMER_OTEL_INGESTION_QUEUE_IS_ENABLED:-true}"
-    networks:
-      - default
 
 
   yugabyte-db:
@@ -301,12 +264,6 @@ services:
 
         until $$PG_READY -d yugabyte; do sleep 10; done
 
-        # Create ybvoyager role if it does not exist
-        role_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_roles WHERE rolname='\''ybvoyager'\''" | tr -d "[:space:]")"
-        if [ "$$role_exists" != "1" ]; then
-          $$YSQL -d yugabyte -c "CREATE ROLE ybvoyager"
-        fi
-
         db_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='\''langfuse'\''" | tr -d "[:space:]")"
         if [ "$$db_exists" != "1" ]; then
           # First-time setup: create metadata DB and load yb_postgres_data.sql.
@@ -360,8 +317,6 @@ services:
 
 volumes:
   langfuse_clickhouse_yugabyte_data:
-    driver: local
-  langfuse_clickhouse_logs:
     driver: local
   langfuse_minio_data:
     driver: local
