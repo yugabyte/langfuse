@@ -98,12 +98,12 @@ const EnvSchema = z.object({
 
   LANGFUSE_USE_AZURE_BLOB: z.enum(["true", "false"]).default("false"),
 
-  CLICKHOUSE_URL: z.string().url(),
-  CLICKHOUSE_USER: z.string(),
+  CLICKHOUSE_URL: z.url().default("http://127.0.0.1:8123"),
+  CLICKHOUSE_USER: z.string().default("clickhouse"),
   CLICKHOUSE_CLUSTER_NAME: z.string().default("default"),
   CLICKHOUSE_DB: z.string().default("default"),
-  CLICKHOUSE_PASSWORD: z.string(),
-  CLICKHOUSE_CLUSTER_ENABLED: z.enum(["true", "false"]).default("true"),
+  CLICKHOUSE_PASSWORD: z.string().default("clickhouse"),
+  CLICKHOUSE_CLUSTER_ENABLED: z.enum(["true", "false"]).default("false"),
   LANGFUSE_EVAL_CREATOR_LIMITER_DURATION: z.coerce
     .number()
     .positive()
