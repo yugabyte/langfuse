@@ -16,16 +16,14 @@ import {
   eventTypes,
   logger,
   traceDeletionProcessor,
-  getTracesFromEventsTableForPublicApi,
-  getTracesCountFromEventsTableForPublicApi,
 } from "@langfuse/shared/src/server";
 import { v4 } from "uuid";
 import { telemetry } from "@/src/features/telemetry";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import {
-  generateTracesForPublicApi,
-  getTracesCountForPublicApi,
-} from "@/src/features/public-api/server/traces";
+  generateTracesForPublicApiPostgres,
+  getTracesCountForPublicApiPostgres,
+} from "@/src/features/public-api/server/traces-postgres";
 import { env } from "@/src/env.mjs";
 
 export default withMiddlewares({
@@ -119,47 +117,15 @@ export default withMiddlewares({
         toTimestamp: query.toTimestamp ?? undefined,
       };
 
-      // Use events table if query parameter is explicitly set, otherwise use environment variable
-      const useEventsTable =
-        query.useEventsTable !== undefined && query.useEventsTable !== null
-          ? query.useEventsTable === true
-          : env.LANGFUSE_ENABLE_EVENTS_TABLE_OBSERVATIONS === "true";
-
-      if (useEventsTable) {
-        const [items, count] = await Promise.all([
-          getTracesFromEventsTableForPublicApi({
-            ...filterProps,
-            advancedFilters: query.filter,
-            orderBy: query.orderBy ?? null,
-          }),
-          getTracesCountFromEventsTableForPublicApi({
-            ...filterProps,
-            advancedFilters: query.filter,
-          }),
-        ]);
-
-        return {
-          data: items.map((item) => ({
-            ...item,
-            externalId: null,
-          })),
-          meta: {
-            page: query.page,
-            limit: query.limit,
-            totalItems: count,
-            totalPages: Math.ceil(count / query.limit),
-          },
-        };
-      }
-
-      // Legacy code path using traces table
+      // Public traces reads use PostgreSQL (tracing schema) in this fork.
+      // `useEventsTable` is accepted for API compatibility but ignored.
       const [items, count] = await Promise.all([
-        generateTracesForPublicApi({
+        generateTracesForPublicApiPostgres({
           props: filterProps,
           advancedFilters: query.filter,
           orderBy: query.orderBy ?? null,
         }),
-        getTracesCountForPublicApi({
+        getTracesCountForPublicApiPostgres({
           props: filterProps,
           advancedFilters: query.filter,
         }),
