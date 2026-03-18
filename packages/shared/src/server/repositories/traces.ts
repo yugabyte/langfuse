@@ -1,20 +1,5 @@
-import {
-  commandClickhouse,
-  parseClickhouseUTCDateTimeFormat,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
-import {
-  createFilterFromFilterState,
-  getProjectIdDefaultFilter,
-} from "../queries/clickhouse-sql/factory";
+import { parseClickhouseUTCDateTimeFormat } from "./clickhouse";
 import { FilterState } from "../../types";
-import {
-  DateTimeFilter,
-  FilterList,
-  StringFilter,
-} from "../queries/clickhouse-sql/clickhouse-filter";
 import { TraceRecordReadType } from "./definitions";
 import { tracesTableUiColumnDefinitions } from "../tableMappings/mapTracesTable";
 import { UiColumnMappings } from "../../tableDefinitions";
@@ -23,11 +8,6 @@ import {
   PreferredClickhouseService,
 } from "../clickhouse/client";
 import { convertClickhouseToDomain } from "./traces_converters";
-import { clickhouseSearchCondition } from "../queries/clickhouse-sql/search";
-import {
-  OBSERVATIONS_TO_TRACE_INTERVAL,
-  TRACE_TO_OBSERVATIONS_INTERVAL,
-} from "./constants";
 import { env } from "../../env";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { recordDistribution } from "../instrumentation";
@@ -64,16 +44,6 @@ const toClickhouseMetadataRecord = (value: unknown): Record<string, string> => {
       typeof v === "string" ? v : JSON.stringify(v),
     ]),
   );
-};
-
-const toJsonValue = (value: unknown) => {
-  if (value === null || value === undefined || value === "") return null;
-  if (typeof value !== "string") return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
 };
 
 const parseDateInput = (value: unknown) => {
@@ -284,7 +254,7 @@ export const getTracesByIds = async (
   traceIds: string[],
   projectId: string,
   timestamp?: Date,
-  clickhouseConfigs?: ClickHouseClientConfigOptions | undefined,
+  _clickhouseConfigs?: ClickHouseClientConfigOptions | undefined,
 ) => {
   const conditions: Prisma.Sql[] = [
     Prisma.sql`project_id = ${projectId}`,
@@ -504,8 +474,8 @@ export const getTraceById = async ({
   timestamp,
   fromTimestamp,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  clickhouseFeatureTag = "tracing",
-  preferredClickhouseService,
+  clickhouseFeatureTag: _clickhouseFeatureTag = "tracing",
+  preferredClickhouseService: _preferredClickhouseService,
   excludeInputOutput = false,
 }: {
   traceId: string;

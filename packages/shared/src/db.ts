@@ -36,7 +36,7 @@ export class PrismaTracingClientSingleton {
     }
 
     PrismaTracingClientSingleton.instance = createPrismaInstance({
-      url: process.env.TRACING_DATABASE_URL,
+      url: process.env.TRACING_DATABASE_URL, // eslint-disable-line turbo/no-undeclared-env-vars
     });
 
     return PrismaTracingClientSingleton.instance;
@@ -111,7 +111,7 @@ declare const globalThis: {
 if (process.env.NODE_ENV === "development") {
   globalThis.prismaGlobal ??= createPrismaInstance(); // regular instantiation
   globalThis.tracingPrismaGlobal ??= createPrismaInstance({
-    url: process.env.TRACING_DATABASE_URL,
+    url: process.env.TRACING_DATABASE_URL, // eslint-disable-line turbo/no-undeclared-env-vars
   });
   globalThis.kyselyPrismaGlobal ??= globalThis.prismaGlobal.$extends(
     kyselyExtension({

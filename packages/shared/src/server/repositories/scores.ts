@@ -5,12 +5,7 @@ import {
   AGGREGATABLE_SCORE_TYPES,
   AggregatableScoreDataType,
 } from "../../domain/scores";
-import {
-  commandClickhouse,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
+import { queryClickhouse, queryClickhouseStream } from "./clickhouse";
 import { FilterList, orderByToClickhouseSql } from "../queries";
 import { FilterCondition, FilterState, TimeFilter } from "../../types";
 import {
@@ -28,7 +23,6 @@ import {
   convertClickhouseScoreToDomain,
   ScoreAggregation,
 } from "./scores_converters";
-import { SCORE_TO_TRACE_OBSERVATIONS_INTERVAL } from "./constants";
 import {
   convertDateToClickhouseDateTime,
   PreferredClickhouseService,
@@ -42,7 +36,6 @@ import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { recordDistribution } from "../instrumentation";
 import { prisma as metadataPrisma, tracingPrisma as prisma } from "../../db";
 import { measureAndReturn } from "../clickhouse/measureAndReturn";
-import { scoresColumnsTableUiColumnDefinitions } from "../tableMappings/mapScoresColumnsTable";
 import { eventsTraceMetadata } from "../queries/clickhouse-sql/query-fragments";
 import { Prisma } from "@prisma/client";
 import { logger } from "../logger";
@@ -493,10 +486,10 @@ const getScoresForTracesInternal = async <
     dataTypes,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   } = props;
 
   const tsLowerBound = timestamp
@@ -607,7 +600,7 @@ export const getScoresForObservations = async <
     observationIds,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
   } = props;
@@ -666,7 +659,7 @@ export const getScoresForObservations = async <
 
 export const getScoresGroupedByNameSourceType = async ({
   projectId,
-  filter,
+  filter: _filter,
   fromTimestamp,
   toTimestamp,
 }: {

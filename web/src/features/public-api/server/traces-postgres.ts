@@ -1,5 +1,5 @@
 import { logger } from "@langfuse/shared/src/server";
-import { tracingPrisma } from "@langfuse/shared/src/db";
+import { prisma as tracingPrisma } from "@langfuse/shared/src/db";
 import { Prisma } from "@prisma/client";
 import type { FilterState } from "@langfuse/shared";
 import type { OrderByState } from "@langfuse/shared";
@@ -46,6 +46,31 @@ type PublicTraceRow = {
   scores: string[] | null;
   total_cost: number | null;
   latency_seconds: number | null;
+};
+
+type PublicApiTrace = {
+  id: string;
+  projectId: string;
+  name: string | null;
+  timestamp: Date;
+  environment: string;
+  tags: string[];
+  bookmarked: boolean;
+  release: string | null;
+  version: string | null;
+  userId: string | null;
+  sessionId: string | null;
+  public: boolean;
+  input: unknown;
+  output: unknown;
+  metadata: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+  observations: string[];
+  scores: string[];
+  totalCost: number;
+  latency: number;
+  htmlPath: string;
 };
 
 const normalizeStringArray = (value?: string | string[]) => {
@@ -118,7 +143,7 @@ export const getTracesCountForPublicApiPostgres = async ({
 }: {
   props: TraceQueryType;
   advancedFilters?: FilterState;
-}) => {
+}): Promise<number> => {
   if (advancedFilters?.length) {
     logger.warn(
       "Public traces advancedFilters are currently ignored in PostgreSQL mode",
@@ -132,7 +157,7 @@ export const getTracesCountForPublicApiPostgres = async ({
   >(Prisma.sql`
     WITH latest_traces AS (
       SELECT DISTINCT ON (t.id, t.project_id) t.id, t.project_id
-      FROM traces t
+      FROM clickhouse.traces t
       WHERE ${whereSql}
       ORDER BY t.id, t.project_id, t.event_ts DESC
     )
@@ -151,7 +176,7 @@ export const generateTracesForPublicApiPostgres = async ({
   props: TraceQueryType;
   advancedFilters?: FilterState;
   orderBy: OrderByState;
-}) => {
+}): Promise<PublicApiTrace[]> => {
   if (advancedFilters?.length) {
     logger.warn(
       "Public traces advancedFilters are currently ignored in PostgreSQL mode",
@@ -160,8 +185,8 @@ export const generateTracesForPublicApiPostgres = async ({
   }
 
   const whereSql = Prisma.join(buildBaseFilters(props), " AND ");
-  const sortColumn = getSortColumn(orderBy?.[0]?.column);
-  const sortDirection = getSortDirection(orderBy?.[0]?.order);
+  const sortColumn = getSortColumn(orderBy?.column ?? null);
+  const sortDirection = getSortDirection(orderBy?.order ?? null);
   const orderSql = Prisma.raw(
     `${sortColumn} ${sortDirection}, lt.id ASC, lt.project_id ASC`,
   );
@@ -187,7 +212,7 @@ export const generateTracesForPublicApiPostgres = async ({
         t.session_id,
         t.created_at,
         t.updated_at
-      FROM traces t
+      FROM clickhouse.traces t
       WHERE ${whereSql}
       ORDER BY t.id, t.project_id, t.event_ts DESC
     ),
@@ -197,7 +222,7 @@ export const generateTracesForPublicApiPostgres = async ({
         array_agg(o.id) as observations,
         SUM(o.total_cost)::double precision as total_cost,
         EXTRACT(EPOCH FROM (MAX(COALESCE(o.end_time, o.start_time)) - MIN(o.start_time)))::double precision as latency_seconds
-      FROM observations o
+      FROM clickhouse.observations o
       INNER JOIN latest_traces lt
         ON lt.id = o.trace_id
         AND lt.project_id = o.project_id
@@ -207,7 +232,7 @@ export const generateTracesForPublicApiPostgres = async ({
       SELECT
         s.trace_id,
         array_agg(s.id) as scores
-      FROM scores s
+      FROM clickhouse.scores s
       INNER JOIN latest_traces lt
         ON lt.id = s.trace_id
         AND lt.project_id = s.project_id
@@ -229,7 +254,7 @@ export const generateTracesForPublicApiPostgres = async ({
     OFFSET ${offset}
   `);
 
-  return rows.map((row) => ({
+  return rows.map((row: PublicTraceRow) => ({
     id: row.id,
     projectId: row.project_id,
     name: row.name,

@@ -7,10 +7,10 @@ import {
   type FilterState,
   type ColumnDefinition,
   type OrderByState,
-  type TableViewPresetState,
   type TableViewPresetTableName,
   type TracingSearchType,
 } from "@langfuse/shared";
+import type { TableViewPresetState } from "@/src/components/table/table-view-presets/types";
 import {
   type RowSelectionState,
   type ColumnOrderState,

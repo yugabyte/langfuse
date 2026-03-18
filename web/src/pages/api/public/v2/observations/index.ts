@@ -59,10 +59,12 @@ export default withMiddlewares({
 
       // Convert empty parent_observation_id to null for consistency with v1
       const transformedItems = dataToReturn.map((item) => {
-        if (item.parentObservationId === "") {
-          return { ...item, parentObservationId: null };
-        }
-        return item;
+        return {
+          ...item,
+          parentObservationId:
+            item.parentObservationId === "" ? null : item.parentObservationId,
+          endTime: item.endTime ?? null,
+        };
       });
 
       // Generate cursor if there are more results
