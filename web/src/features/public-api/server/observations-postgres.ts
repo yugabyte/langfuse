@@ -57,7 +57,11 @@ type PublicObservationRow = {
 
 const normalizeStringArray = (value?: string | string[]) => {
   if (!value) return [];
-  return Array.isArray(value) ? value : [value];
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 };
 
 const toStringifiedJson = (value: unknown): string | null => {

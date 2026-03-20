@@ -69,12 +69,15 @@ export default withMiddlewares({
               },
             })
           : [];
+      const modelById = new Map(models.map((model) => [model.id, model]));
       const finalCount = count ? count : 0;
 
       return {
         data: items
           .map((i: Observation) => {
-            const model = models.find((m) => m.id === i.internalModelId);
+            const model = i.internalModelId
+              ? modelById.get(i.internalModelId)
+              : undefined;
             return {
               ...i,
               modelId: model?.id ?? null,

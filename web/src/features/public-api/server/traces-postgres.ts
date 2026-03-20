@@ -1,6 +1,7 @@
 import { logger } from "@langfuse/shared/src/server";
 import { prisma as tracingPrisma } from "@langfuse/shared/src/db";
 import { Prisma } from "@prisma/client";
+import { InvalidRequestError } from "@langfuse/shared";
 import type { FilterState } from "@langfuse/shared";
 import type { OrderByState } from "@langfuse/shared";
 import type { TraceFieldGroup } from "@/src/features/public-api/types/traces";
@@ -75,7 +76,11 @@ type PublicApiTrace = {
 
 const normalizeStringArray = (value?: string | string[]) => {
   if (!value) return [];
-  return Array.isArray(value) ? value : [value];
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 };
 
 const parseMaybeJson = (value: unknown) => {
@@ -99,7 +104,16 @@ const getSortColumn = (column?: string | null) => {
     bookmarked: "lt.bookmarked",
     sessionId: "lt.session_id",
   };
-  return map[column ?? ""] ?? "lt.timestamp";
+  if (!column) return "lt.timestamp";
+
+  const mappedColumn = map[column];
+  if (!mappedColumn) {
+    throw new InvalidRequestError(
+      `Unsupported orderBy column "${column}". Supported columns: ${Object.keys(map).join(", ")}`,
+    );
+  }
+
+  return mappedColumn;
 };
 
 const getSortDirection = (order?: string | null) =>
