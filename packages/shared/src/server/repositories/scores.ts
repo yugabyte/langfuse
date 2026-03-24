@@ -335,7 +335,7 @@ export const getScoresForSessions = async <
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
       FROM scores s
       WHERE s.project_id = ${projectId}
@@ -391,7 +391,7 @@ export const getScoresForDatasetRuns = async <
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
       FROM scores s
       WHERE s.project_id = ${projectId}
@@ -440,7 +440,7 @@ export const getTraceScoresForDatasetRuns = async (
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         dri.dataset_run_id as run_id,
         ROW_NUMBER() OVER (
           PARTITION BY s.id, s.project_id, dri.dataset_run_id
@@ -616,7 +616,7 @@ export const getScoresForObservations = async <
       s.*,
       ${
         includeHasMetadata
-          ? Prisma.sql`CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END`
+          ? Prisma.sql`CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END`
           : Prisma.sql`0`
       } AS has_metadata
     FROM scores s

@@ -859,7 +859,7 @@ const getObservationsTableInternal = async <T>(
       o.internal_model_id,
       (EXTRACT(EPOCH FROM (COALESCE(o.end_time, o.start_time) - o.start_time)) * 1000)::text AS latency,
       (EXTRACT(EPOCH FROM (COALESCE(o.completion_start_time, o.start_time) - o.start_time)) * 1000)::text AS time_to_first_token,
-      jsonb_object_length(COALESCE(o.tool_definitions, '{}'::jsonb))::text AS tool_definitions_count,
+      (SELECT count(*) FROM jsonb_object_keys(COALESCE(o.tool_definitions, '{}'::jsonb)))::text AS tool_definitions_count,
       jsonb_array_length(COALESCE(o.tool_calls, '[]'::jsonb))::text AS tool_calls_count
       ${opts.selectIOAndMetadata ? Prisma.sql`, o.input, o.output, o.metadata` : Prisma.empty}
     ${fromWithJoin}

@@ -1,11 +1,4 @@
-import { convertApiProvidedFilterToClickhouseFilter } from "@langfuse/shared/src/server";
-import {
-  convertDateToClickhouseDateTime,
-  queryClickhouse,
-  TRACE_TO_OBSERVATIONS_INTERVAL,
-  type DateTimeFilter,
-  measureAndReturn,
-} from "@langfuse/shared/src/server";
+import { Prisma, prisma as tracingPrisma } from "@langfuse/shared/src/db";
 
 type QueryType = {
   page: number;
@@ -14,246 +7,199 @@ type QueryType = {
   userId?: string;
   tags?: string | string[];
   traceName?: string;
+  traceEnvironment?: string | string[];
+  observationEnvironment?: string | string[];
   fromTimestamp?: string;
   toTimestamp?: string;
 };
 
-export const generateDailyMetrics = async (props: QueryType) => {
-  const filter = convertApiProvidedFilterToClickhouseFilter(
-    props,
-    filterParams,
+const normalizeStringArray = (value?: string | string[]) => {
+  if (!value) return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+};
+
+const buildTraceFilters = (props: QueryType) => {
+  const clauses: Prisma.Sql[] = [
+    Prisma.sql`t.project_id = ${props.projectId}`,
+    Prisma.sql`t.is_deleted = false`,
+  ];
+
+  if (props.userId) clauses.push(Prisma.sql`t.user_id = ${props.userId}`);
+  if (props.traceName) clauses.push(Prisma.sql`t.name = ${props.traceName}`);
+  if (props.fromTimestamp)
+    clauses.push(Prisma.sql`t.timestamp >= ${new Date(props.fromTimestamp)}`);
+  if (props.toTimestamp)
+    clauses.push(Prisma.sql`t.timestamp < ${new Date(props.toTimestamp)}`);
+
+  const tags = normalizeStringArray(props.tags);
+  if (tags.length > 0) clauses.push(Prisma.sql`t.tags && ${tags}`);
+
+  const traceEnvironments = normalizeStringArray(props.traceEnvironment);
+  if (traceEnvironments.length === 1) {
+    clauses.push(Prisma.sql`t.environment = ${traceEnvironments[0]}`);
+  } else if (traceEnvironments.length > 1) {
+    clauses.push(
+      Prisma.sql`t.environment IN (${Prisma.join(traceEnvironments)})`,
+    );
+  }
+
+  return clauses;
+};
+
+const buildObservationFilters = (props: QueryType) => {
+  const clauses: Prisma.Sql[] = [
+    Prisma.sql`o.project_id = ${props.projectId}`,
+    Prisma.sql`o.is_deleted = false`,
+  ];
+
+  if (props.fromTimestamp)
+    clauses.push(Prisma.sql`o.start_time >= ${new Date(props.fromTimestamp)}`);
+  if (props.toTimestamp)
+    clauses.push(Prisma.sql`o.start_time < ${new Date(props.toTimestamp)}`);
+
+  const observationEnvironments = normalizeStringArray(
+    props.observationEnvironment,
   );
-  const hasTracesFilter = filter.some((f) => f.clickhouseTable === "traces");
-  const tracesFilter = filter.filter((f) => f.clickhouseTable === "traces");
-  const appliedFilter = filter.apply();
-  const appliedTracesFilter = tracesFilter.apply();
+  if (observationEnvironments.length === 1) {
+    clauses.push(Prisma.sql`o.environment = ${observationEnvironments[0]}`);
+  } else if (observationEnvironments.length > 1) {
+    clauses.push(
+      Prisma.sql`o.environment IN (${Prisma.join(observationEnvironments)})`,
+    );
+  }
 
-  const timeFilter = filter.find(
-    (f) =>
-      f.clickhouseTable === "traces" &&
-      f.field.includes("timestamp") &&
-      (f.operator === ">=" || f.operator === ">"),
-  ) as DateTimeFilter | undefined;
+  return clauses;
+};
 
-  // If there is any other filter than fromTimestamp, we join the traces table to be on the safe side.
-  const hasNonTimestampsFilter =
-    (timeFilter && filter.length() > 1) || (!timeFilter && filter.length() > 0);
+type DailyMetricsRow = {
+  date: string;
+  count_traces: number;
+  count_observations: number;
+  total_cost: number;
+  usage: unknown;
+};
 
-  const query = `
-    WITH model_usage AS (
+type DailyMetricsCountRow = {
+  count: bigint;
+};
+
+export const generateDailyMetrics = async (props: QueryType) => {
+  const traceWhereSql = Prisma.join(buildTraceFilters(props), " AND ");
+  const observationWhereSql = Prisma.join(
+    buildObservationFilters(props),
+    " AND ",
+  );
+  const limit = props.limit;
+  const offset = (props.page - 1) * props.limit;
+
+  const rows = await tracingPrisma.$queryRaw<DailyMetricsRow[]>(Prisma.sql`
+    WITH latest_traces AS (
+      SELECT DISTINCT ON (t.id, t.project_id)
+        t.id,
+        t.project_id,
+        t.timestamp
+      FROM clickhouse.traces t
+      WHERE ${traceWhereSql}
+      ORDER BY t.id, t.project_id, t.event_ts DESC
+    ),
+    latest_observations AS (
+      SELECT DISTINCT ON (o.id, o.project_id)
+        o.id,
+        o.project_id,
+        o.trace_id,
+        o.start_time,
+        o.provided_model_name,
+        o.usage_details,
+        o.total_cost
+      FROM clickhouse.observations o
+      WHERE ${observationWhereSql}
+      ORDER BY o.id, o.project_id, o.event_ts DESC
+    ),
+    trace_usage AS (
       SELECT
-        toDate(o.start_time) as date,
-        o.provided_model_name as model,
-        count(o.id) as countObservations,
-        count(distinct o.trace_id) as countTraces,
-        sum(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, o.usage_details)))) as inputUsage,
-        sum(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, o.usage_details)))) as outputUsage,
-        sumMap(o.usage_details)['total'] as totalUsage,
-        sum(coalesce(o.total_cost, 0)) as totalCost
-      FROM observations o FINAL ${hasNonTimestampsFilter ? " LEFT JOIN __TRACE_TABLE__ t FINAL on o.trace_id = t.id AND o.project_id = t.project_id" : ""}
-      WHERE o.project_id = {projectId: String}
-      ${hasNonTimestampsFilter ? `AND t.project_id = {projectId: String} AND ${appliedFilter.query}` : ""}
-      ${timeFilter ? `AND start_time >= {cteTimeFilter: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-      GROUP BY date, model
-    ), daily_model_usage AS (
+        to_char(date_trunc('day', lt.timestamp), 'YYYY-MM-DD') AS date,
+        count(*)::int AS count_traces
+      FROM latest_traces lt
+      GROUP BY 1
+    ),
+    model_usage AS (
       SELECT
-        "date",
-        sum(mu.countObservations) as countObservations,
-        sum(mu.totalCost) as totalCost,
-        groupArray(tuple(
-          mu.model,
-          mu.inputUsage,
-          mu.outputUsage,
-          mu.totalUsage,
-          mu.totalCost,
-          mu.countObservations,
-          mu.countTraces
-        )) as daily_usage_tuple
+        to_char(date_trunc('day', lo.start_time), 'YYYY-MM-DD') AS date,
+        lo.provided_model_name AS model,
+        count(*)::int AS count_observations,
+        count(DISTINCT lo.trace_id)::int AS count_traces,
+        COALESCE(sum((lo.usage_details->>'input')::double precision), 0) AS input_usage,
+        COALESCE(sum((lo.usage_details->>'output')::double precision), 0) AS output_usage,
+        COALESCE(sum((lo.usage_details->>'total')::double precision), 0) AS total_usage,
+        COALESCE(sum(lo.total_cost::double precision), 0) AS total_cost
+      FROM latest_observations lo
+      INNER JOIN latest_traces lt
+        ON lt.id = lo.trace_id
+        AND lt.project_id = lo.project_id
+      GROUP BY 1, 2
+    ),
+    daily_model_usage AS (
+      SELECT
+        mu.date,
+        sum(mu.count_observations)::int AS count_observations,
+        sum(mu.total_cost)::double precision AS total_cost,
+        json_agg(
+          json_build_object(
+            'model', mu.model,
+            'inputUsage', mu.input_usage,
+            'outputUsage', mu.output_usage,
+            'totalUsage', mu.total_usage,
+            'totalCost', mu.total_cost,
+            'countObservations', mu.count_observations,
+            'countTraces', mu.count_traces
+          )
+          ORDER BY mu.model NULLS FIRST
+        ) AS usage
       FROM model_usage mu
-      GROUP BY date
-    ), trace_usage AS (
-      SELECT
-        toDate(t.timestamp) as date,
-        count(t.id) as countTraces
-      FROM __TRACE_TABLE__ t FINAL
-      WHERE t.project_id = {projectId: String}
-      ${hasTracesFilter ? `AND ${appliedTracesFilter.query}` : ""}
-      GROUP BY date
+      GROUP BY mu.date
     )
-
     SELECT
-      COALESCE(dmu.date, tu.date) as date,
-      COALESCE(tu.countTraces, 0) as countTraces,
-      COALESCE(dmu.countObservations, 0) as countObservations,
-      COALESCE(dmu.totalCost, 0) as totalCost,
-      dmu.daily_usage_tuple as usage
+      COALESCE(dmu.date, tu.date) AS date,
+      COALESCE(tu.count_traces, 0)::int AS count_traces,
+      COALESCE(dmu.count_observations, 0)::int AS count_observations,
+      COALESCE(dmu.total_cost, 0)::double precision AS total_cost,
+      COALESCE(dmu.usage, '[]'::json) AS usage
     FROM daily_model_usage dmu
     FULL OUTER JOIN trace_usage tu ON dmu.date = tu.date
     ORDER BY date DESC
-    ${props.limit !== undefined && props.page !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
-  `;
+    LIMIT ${limit}
+    OFFSET ${offset}
+  `);
 
-  const timestamp = props.fromTimestamp
-    ? new Date(props.fromTimestamp)
-    : timeFilter?.value;
-
-  return measureAndReturn({
-    operationName: "generateDailyMetrics",
-    projectId: props.projectId,
-    input: {
-      params: {
-        ...appliedTracesFilter.params,
-        ...appliedFilter.params,
-        projectId: props.projectId,
-        ...(props.limit !== undefined ? { limit: props.limit } : {}),
-        ...(props.page !== undefined
-          ? { offset: (props.page - 1) * props.limit }
-          : {}),
-        ...(timeFilter
-          ? {
-              cteTimeFilter: convertDateToClickhouseDateTime(timeFilter.value),
-            }
-          : {}),
-      },
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "daily_metrics",
-        projectId: props.projectId,
-        operation_name: "generateDailyMetrics",
-      },
-      timestamp,
-    },
-    fn: async (input) => {
-      const result = await queryClickhouse<{
-        date: string;
-        countTraces: number;
-        countObservations: number;
-        totalCost: number;
-        usage: (string | null)[][];
-      }>({
-        query: query.replaceAll("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: input.tags,
-        clickhouseConfigs: {
-          request_timeout: 60_000, // Use 1 minute timeout for daily metrics
-        },
-      });
-
-      return result.map((record) => ({
-        date: record.date,
-        countTraces: Number(record.countTraces),
-        countObservations: Number(record.countObservations),
-        totalCost: Number(record.totalCost),
-        usage: record.usage.map((u) => ({
-          model: u[0],
-          inputUsage: Number(u[1]),
-          outputUsage: Number(u[2]),
-          totalUsage: Number(u[3]),
-          totalCost: Number(u[4]),
-          countObservations: Number(u[5]),
-          countTraces: Number(u[6]),
-        })),
-      }));
-    },
-  });
+  return rows.map((row) => ({
+    date: row.date,
+    countTraces: Number(row.count_traces ?? 0),
+    countObservations: Number(row.count_observations ?? 0),
+    totalCost: Number(row.total_cost ?? 0),
+    usage: Array.isArray(row.usage) ? row.usage : [],
+  }));
 };
 
 export const getDailyMetricsCount = async (props: QueryType) => {
-  const filter = convertApiProvidedFilterToClickhouseFilter(
-    props,
-    filterParams,
-  );
-  const appliedFilter = filter
-    .filter((f) => f.clickhouseTable === "traces")
-    .apply();
+  const traceWhereSql = Prisma.join(buildTraceFilters(props), " AND ");
 
-  const query = `
-    SELECT count(distinct toDate(timestamp)) as count
-    FROM __TRACE_TABLE__ t
-    WHERE project_id = {projectId: String}
-    ${filter.length() > 0 ? `AND ${appliedFilter.query}` : ""}
-  `;
+  const rows = await tracingPrisma.$queryRaw<DailyMetricsCountRow[]>(Prisma.sql`
+    WITH latest_traces AS (
+      SELECT DISTINCT ON (t.id, t.project_id)
+        t.id,
+        t.project_id,
+        t.timestamp
+      FROM clickhouse.traces t
+      WHERE ${traceWhereSql}
+      ORDER BY t.id, t.project_id, t.event_ts DESC
+    )
+    SELECT count(DISTINCT date_trunc('day', lt.timestamp))::bigint AS count
+    FROM latest_traces lt
+  `);
 
-  const timestamp = props.fromTimestamp
-    ? new Date(props.fromTimestamp)
-    : undefined;
-
-  return measureAndReturn({
-    operationName: "getDailyMetricsCount",
-    projectId: props.projectId,
-    input: {
-      params: { ...appliedFilter.params, projectId: props.projectId },
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "daily_metrics_count",
-        projectId: props.projectId,
-        operation_name: "getDailyMetricsCount",
-      },
-      timestamp,
-    },
-    fn: async (input) => {
-      const records = await queryClickhouse<{ count: string }>({
-        query: query.replace("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: input.tags,
-      });
-      return records.map((record) => Number(record.count)).shift();
-    },
-  });
+  return Number(rows[0]?.count ?? 0n);
 };
-
-const filterParams = [
-  {
-    id: "userId",
-    clickhouseSelect: "user_id",
-    filterType: "StringFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-  {
-    id: "traceName",
-    clickhouseSelect: "name",
-    filterType: "StringFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-  {
-    id: "tags",
-    clickhouseSelect: "tags",
-    filterType: "ArrayOptionsFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-  {
-    id: "traceEnvironment",
-    clickhouseSelect: "environment",
-    filterType: "StringOptionsFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-  {
-    id: "observationEnvironment",
-    clickhouseSelect: "environment",
-    filterType: "StringOptionsFilter",
-    clickhouseTable: "observations",
-    clickhousePrefix: "o",
-  },
-  {
-    id: "fromTimestamp",
-    clickhouseSelect: "timestamp",
-    operator: ">=" as const,
-    filterType: "DateTimeFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-  {
-    id: "toTimestamp",
-    clickhouseSelect: "timestamp",
-    operator: "<" as const,
-    filterType: "DateTimeFilter",
-    clickhouseTable: "traces",
-    clickhousePrefix: "t",
-  },
-];

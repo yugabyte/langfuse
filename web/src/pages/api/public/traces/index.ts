@@ -21,9 +21,9 @@ import { v4 } from "uuid";
 import { telemetry } from "@/src/features/telemetry";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import {
-  generateTracesForPublicApiPostgres,
-  getTracesCountForPublicApiPostgres,
-} from "@/src/features/public-api/server/traces-postgres";
+  generateTracesForPublicApi,
+  getTracesCountForPublicApi,
+} from "@/src/features/public-api/server/traces";
 import { env } from "@/src/env.mjs";
 
 export default withMiddlewares({
@@ -120,12 +120,12 @@ export default withMiddlewares({
       // Public traces reads use PostgreSQL (tracing schema) in this fork.
       // `useEventsTable` is accepted for API compatibility but ignored.
       const [items, count] = await Promise.all([
-        generateTracesForPublicApiPostgres({
+        generateTracesForPublicApi({
           props: filterProps,
           advancedFilters: query.filter,
           orderBy: query.orderBy ?? null,
         }),
-        getTracesCountForPublicApiPostgres({
+        getTracesCountForPublicApi({
           props: filterProps,
           advancedFilters: query.filter,
         }),

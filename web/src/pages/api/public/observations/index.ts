@@ -10,9 +10,9 @@ import {
   transformDbToApiObservation,
 } from "@/src/features/public-api/types/observations";
 import {
-  generateObservationsForPublicApiPostgres,
-  getObservationsCountForPublicApiPostgres,
-} from "@/src/features/public-api/server/observations-postgres";
+  generateObservationsForPublicApi,
+  getObservationsCountForPublicApi,
+} from "@/src/features/public-api/server/observations";
 
 export default withMiddlewares({
   GET: createAuthedProjectAPIRoute({
@@ -38,11 +38,11 @@ export default withMiddlewares({
       };
 
       const [items, count] = await Promise.all([
-        generateObservationsForPublicApiPostgres({
+        generateObservationsForPublicApi({
           props: filterProps,
           advancedFilters: query.filter,
         }),
-        getObservationsCountForPublicApiPostgres({
+        getObservationsCountForPublicApi({
           props: filterProps,
           advancedFilters: query.filter,
         }),

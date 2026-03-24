@@ -29,7 +29,15 @@ COPY --from=pruner /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
 COPY --from=pruner /app/out/pnpm-workspace.yaml ./pnpm-workspace.yaml
 COPY --from=pruner /app/out/json/ .
 
-RUN pnpm install --frozen-lockfile
+RUN sh -c ' \
+  start_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+  start_epoch=$(date +%s); \
+  echo "[build-timing] web builder pnpm install started: ${start_ts}"; \
+  pnpm install --frozen-lockfile; \
+  end_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+  end_epoch=$(date +%s); \
+  echo "[build-timing] web builder pnpm install finished: ${end_ts} (elapsed=$((end_epoch-start_epoch))s)"; \
+'
 
 ENV DOCKER_BUILD 1
 ENV NEXT_MANUAL_SIG_HANDLE true
@@ -85,7 +93,15 @@ ENV NEXT_MANUAL_SIG_HANDLE true
 # set the CI flag to true to get CI specific logs
 ENV CI true
 
-RUN NODE_OPTIONS='--max-old-space-size-percentage=75' turbo run build --filter=web...
+RUN sh -c ' \
+  start_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+  start_epoch=$(date +%s); \
+  echo "[build-timing] web turbo build started: ${start_ts}"; \
+  NODE_OPTIONS="--max-old-space-size-percentage=75" turbo run build --filter=web...; \
+  end_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+  end_epoch=$(date +%s); \
+  echo "[build-timing] web turbo build finished: ${end_ts} (elapsed=$((end_epoch-start_epoch))s)"; \
+'
 
 # Production image, copy all the files and run next
 FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS runner
