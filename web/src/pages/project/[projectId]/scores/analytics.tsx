@@ -46,10 +46,6 @@ export default function ScoresAnalyticsV2Page() {
     }
   }, [projectId, router]);
 
-  if (!SCORES_PAGE_ENABLED) {
-    return null;
-  }
-
   const urlStateHook = useAnalyticsUrlState();
   const { state: urlState, setScore2 } = urlStateHook;
 
@@ -62,7 +58,7 @@ export default function ScoresAnalyticsV2Page() {
     error: scoresError,
   } = api.scoreAnalytics.getScoreIdentifiers.useQuery(
     { projectId },
-    { enabled: !!projectId },
+    { enabled: !!projectId && SCORES_PAGE_ENABLED },
   );
 
   // Transform API data to ScoreOption format and sort by dataType
@@ -196,6 +192,10 @@ export default function ScoresAnalyticsV2Page() {
   const hasNoScores =
     !scoresLoading && scoreOptions.length === 0 && !scoresError;
   const hasNoSelection = !hasError && !hasNoScores && !urlState.score1;
+
+  if (!SCORES_PAGE_ENABLED) {
+    return null;
+  }
 
   return (
     <Page

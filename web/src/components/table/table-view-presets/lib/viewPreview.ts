@@ -1,4 +1,5 @@
-import { type FilterState, type TableViewPresetState } from "@langfuse/shared";
+import { type FilterState } from "@langfuse/shared";
+import type { TableViewPresetState } from "@/src/components/table/table-view-presets/types";
 
 function formatFilterLabel(filter: FilterState[number]) {
   return "key" in filter && filter.key

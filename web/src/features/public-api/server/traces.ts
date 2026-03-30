@@ -1,26 +1,10 @@
-import {
-  convertDateToClickhouseDateTime,
-  queryClickhouse,
-  TRACE_TO_OBSERVATIONS_INTERVAL,
-  orderByToClickhouseSql,
-  type DateTimeFilter,
-  convertClickhouseTracesListToDomain,
-  type TraceRecordReadType,
-  measureAndReturn,
-  deriveFilters,
-  createPublicApiTracesColumnMapping,
-  tracesTableUiColumnDefinitions,
-  shouldSkipObservationsFinal,
-} from "@langfuse/shared/src/server";
-import { AGGREGATABLE_SCORE_TYPES, type OrderByState } from "@langfuse/shared";
-import {
-  TRACE_FIELD_GROUPS,
-  type TraceFieldGroup,
-} from "@/src/features/public-api/types/traces";
-import { env } from "@/src/env.mjs";
-
+import { logger } from "@langfuse/shared/src/server";
+import { prisma as tracingPrisma } from "@langfuse/shared/src/db";
+import { Prisma } from "@prisma/client";
+import { InvalidRequestError } from "@langfuse/shared";
 import type { FilterState } from "@langfuse/shared";
-import snakeCase from "lodash/snakeCase";
+import type { OrderByState } from "@langfuse/shared";
+import type { TraceFieldGroup } from "@/src/features/public-api/types/traces";
 
 export type TraceQueryType = {
   page: number;
@@ -41,273 +25,162 @@ export type TraceQueryType = {
   useEventsTable?: boolean | null;
 };
 
-async function buildTracesBaseQuery(
-  props: TraceQueryType,
-  select:
-    | {
-        includeObservations: boolean;
-        includeIO: boolean;
-        includeMetrics: boolean;
-        includeScores: boolean;
-        count: false;
-      }
-    | {
-        includeObservations: false;
-        includeIO: false;
-        includeMetrics: false;
-        includeScores: false;
-        count: true;
-      },
-  advancedFilters?: FilterState,
-  orderBy?: OrderByState,
-): Promise<{
-  query: string;
-  params: Record<string, any>;
-  fromTimeFilter?: DateTimeFilter | undefined;
-}> {
-  // ClickHouse query optimizations for List Traces API
-  const disableObservationsFinal = await shouldSkipObservationsFinal(
-    props.projectId,
-  );
-  const propagateObservationsTimeBounds =
-    env.LANGFUSE_API_CLICKHOUSE_PROPAGATE_OBSERVATIONS_TIME_BOUNDS === "true";
+type PublicTraceRow = {
+  id: string;
+  project_id: string;
+  timestamp: Date;
+  name: string | null;
+  user_id: string | null;
+  metadata: unknown;
+  release: string | null;
+  version: string | null;
+  environment: string | null;
+  public: boolean;
+  bookmarked: boolean;
+  tags: string[] | null;
+  input: string | null;
+  output: string | null;
+  session_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+  observations: string[] | null;
+  scores: string[] | null;
+  total_cost: number | null;
+  latency_seconds: number | null;
+};
 
-  let filter = deriveFilters(
-    props,
-    filterParams,
-    advancedFilters,
-    tracesTableUiColumnDefinitions,
-  );
-  const appliedFilter = filter.apply();
+type PublicApiTrace = {
+  id: string;
+  projectId: string;
+  name: string | null;
+  timestamp: Date;
+  environment: string;
+  tags: string[];
+  bookmarked: boolean;
+  release: string | null;
+  version: string | null;
+  userId: string | null;
+  sessionId: string | null;
+  public: boolean;
+  input: unknown;
+  output: unknown;
+  metadata: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+  observations: string[];
+  scores: string[];
+  totalCost: number;
+  latency: number;
+  htmlPath: string;
+};
 
-  const fromTimeFilter = filter.find(
-    (f) =>
-      f.clickhouseTable === "traces" &&
-      f.field.includes("timestamp") &&
-      (f.operator === ">=" || f.operator === ">"),
-  ) as DateTimeFilter | undefined;
-  const toTimeFilter = filter.find(
-    (f) =>
-      f.clickhouseTable === "traces" &&
-      f.field.includes("timestamp") &&
-      (f.operator === "<=" || f.operator === "<"),
-  ) as DateTimeFilter | undefined;
+const normalizeStringArray = (value?: string | string[]) => {
+  if (!value) return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values
+    .flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+};
 
-  // We need to drop the clickhousePrefix here to make the filter work for the observations and scores tables.
-  const environmentFilter = filter
-    .filter((f) => f.field === "environment")
-    .map((f) => {
-      f.tablePrefix = undefined;
-      return f;
-    });
-  const appliedEnvironmentFilter = environmentFilter.apply();
-
-  // This _must_ be updated if we add a new skip index column to the traces table.
-  // Otherwise, we will ignore it in most cases due to `FINAL`.
-  const shouldUseSkipIndexes = filter.some(
-    (f) =>
-      f.clickhouseTable === "traces" &&
-      ["user_id", "session_id", "metadata"].some((skipIndexCol) =>
-        f.field.includes(skipIndexCol),
-      ),
-  );
-
-  // Check if any filters reference the observations or scores tables
-  const filtersNeedObservations = filter.some(
-    (f) => f.clickhouseTable === "observations",
-  );
-  const filtersNeedScores = filter.some((f) => f.clickhouseTable === "scores");
-
-  // Check if filters specifically reference score aggregation columns
-  const hasScoreAggregationFilters = filter.some(
-    (f) => f.field === "s.scores_avg" || f.field === "s.score_categories",
-  );
-
-  // Build CTEs conditionally based on requested fields OR filters
-  const ctes = [];
-
-  if (
-    select.includeObservations ||
-    select.includeMetrics ||
-    filtersNeedObservations
-  ) {
-    // Conditionally add FINAL based on env var and whether metrics are requested
-    const shouldUseFinal =
-      (select.includeMetrics || filtersNeedObservations) &&
-      !disableObservationsFinal;
-
-    // Include metrics in CTE if requested OR if filters need them
-    const includeMetricsInCTE =
-      select.includeMetrics || filtersNeedObservations;
-
-    ctes.push(`
-    observation_stats AS (
-      SELECT
-        trace_id,
-        project_id,
-        ${includeMetricsInCTE ? "sum(total_cost) as total_cost, date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds, " : ""}
-        sumMap(usage_details) as usage_details,
-        sumMap(cost_details) as cost_details,
-        multiIf(arrayExists(x -> x = 'ERROR', groupArray(level)), 'ERROR', arrayExists(x -> x = 'WARNING', groupArray(level)), 'WARNING', arrayExists(x -> x = 'DEFAULT', groupArray(level)), 'DEFAULT', 'DEBUG') AS aggregated_level,
-        countIf(level = 'WARNING') as warning_count,
-        countIf(level = 'ERROR') as error_count,
-        countIf(level = 'DEFAULT') as default_count,
-        countIf(level = 'DEBUG') as debug_count,
-        groupUniqArray(id) as observation_ids
-      FROM observations ${shouldUseFinal ? "FINAL" : ""}
-      WHERE project_id = {projectId: String}
-      ${fromTimeFilter ? `AND start_time >= {cteFromTimeFilter: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-      ${toTimeFilter && propagateObservationsTimeBounds ? `AND start_time <= {cteToTimeFilter: DateTime64(3)} + ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-      ${toTimeFilter && propagateObservationsTimeBounds ? `AND end_time <= {cteToTimeFilter: DateTime64(3)} + ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-      ${environmentFilter.length() > 0 ? `AND ${appliedEnvironmentFilter.query}` : ""}
-      GROUP BY project_id, trace_id
-    )`);
+const parseMaybeJson = (value: unknown) => {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
   }
+};
 
-  if (select.includeScores || filtersNeedScores) {
-    // Use nested structure with pre-aggregation when score filters are present
-    // This ensures proper avg() computation and enables array filtering
-    if (hasScoreAggregationFilters) {
-      ctes.push(`
-    score_stats AS (
-      SELECT
-        trace_id,
-        project_id,
-        groupUniqArray(id) as score_ids,
-        groupArrayIf(tuple(name, avg_value), data_type IN ('NUMERIC', 'BOOLEAN')) AS scores_avg,
-        groupArrayIf(concat(name, ':', string_value), data_type = 'CATEGORICAL' AND notEmpty(string_value)) AS score_categories
-      FROM (
-        SELECT
-          project_id,
-          trace_id,
-          id,
-          name,
-          data_type,
-          string_value,
-          avg(value) as avg_value
-        FROM scores FINAL
-        WHERE project_id = {projectId: String}
-        AND session_id IS NULL
-        AND dataset_run_id IS NULL
-        AND data_type IN ({dataTypes: Array(String)})
-        ${fromTimeFilter ? `AND timestamp >= {cteFromTimeFilter: DateTime64(3)}` : ""}
-        ${environmentFilter.length() > 0 ? `AND ${appliedEnvironmentFilter.query}` : ""}
-        GROUP BY
-          project_id,
-          trace_id,
-          id,
-          name,
-          data_type,
-          string_value
-      ) tmp
-      GROUP BY project_id, trace_id
-    )`);
-    } else {
-      // Use flat structure when no score filters present (backward compatible, better performance)
-      ctes.push(`
-    score_stats AS (
-      SELECT
-        trace_id,
-        project_id,
-        groupUniqArray(id) as score_ids,
-        groupArrayIf(tuple(name, value), data_type IN ('NUMERIC', 'BOOLEAN')) as scores_avg,
-        groupArrayIf(concat(name, ':', string_value), data_type = 'CATEGORICAL') as score_categories
-      FROM scores
-      WHERE project_id = {projectId: String}
-      AND session_id IS NULL
-      AND dataset_run_id IS NULL
-      AND data_type IN ({dataTypes: Array(String)})
-      ${fromTimeFilter ? `AND timestamp >= {cteFromTimeFilter: DateTime64(3)}` : ""}
-      ${environmentFilter.length() > 0 ? `AND ${appliedEnvironmentFilter.query}` : ""}
-      GROUP BY project_id, trace_id
-    )`);
-    }
-  }
-
-  const withClause = ctes.length > 0 ? `WITH ${ctes.join(", ")}` : "";
-
-  // If user provides an order we prefer it or fallback to timestamp as the default.
-  // In both cases we append a t.event_ts desc order to pick the latest event in case of duplicates
-  // if we want to use a skip index.
-  // This may still return stale information if the orderBy key was updated between traces or if a filter
-  // applies only to a stale value.
-  const chOrderBy =
-    (orderByToClickhouseSql(orderBy || [], orderByColumns) ||
-      "ORDER BY t.timestamp desc") +
-    (shouldUseSkipIndexes ? ", t.event_ts desc" : "");
-
-  const queryMiddle = `
-  FROM traces t ${shouldUseSkipIndexes ? "" : "FINAL"}
-  ${select.includeObservations || select.includeMetrics || filtersNeedObservations ? "LEFT JOIN observation_stats o ON t.id = o.trace_id AND t.project_id = o.project_id" : ""}
-  ${select.includeScores || filtersNeedScores ? "LEFT JOIN score_stats s ON t.id = s.trace_id AND t.project_id = s.project_id" : ""}
-  WHERE t.project_id = {projectId: String}
-  ${filter.length() > 0 ? `AND ${appliedFilter.query}` : ""}
-  `;
-
-  const query = select.count
-    ? `${withClause}
-  	SELECT count() as count
-   	${queryMiddle}
-  `
-    : `
-    ${withClause}
-
-    SELECT
-      -- Core fields (always included)
-      t.id as id,
-      CONCAT('/project/', t.project_id, '/traces/', t.id) as "htmlPath",
-      t.project_id as project_id,
-      t.timestamp as timestamp,
-      t.name as name,
-      t.environment as environment,
-      t.session_id as session_id,
-      t.user_id as user_id,
-      t.release as release,
-      t.version as version,
-      t.bookmarked as bookmarked,
-      t.public as public,
-      t.tags as tags,
-      t.created_at as created_at,
-      t.updated_at as updated_at
-      -- IO fields (conditional)
-      ${select.includeIO ? ", t.input as input, t.output as output, t.metadata as metadata" : ""}
-      -- Scores (conditional)
-      ${select.includeScores ? ", s.score_ids as scores" : ""}
-      -- Observations (conditional)
-      ${select.includeObservations ? ", o.observation_ids as observations" : ""}
-      -- Metrics (conditional)
-      ${select.includeMetrics ? ", COALESCE(o.latency_milliseconds / 1000, 0) as latency, COALESCE(o.total_cost, 0) as totalCost" : ""}
-    ${queryMiddle}
-    ${chOrderBy}
-    ${shouldUseSkipIndexes ? "LIMIT 1 by t.id, t.project_id" : ""}
-    ${props.limit !== undefined && props.page !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
-  `;
-
-  const params = {
-    ...appliedEnvironmentFilter.params,
-    ...appliedFilter.params,
-    projectId: props.projectId,
-    dataTypes: AGGREGATABLE_SCORE_TYPES,
-    ...(props.limit !== undefined ? { limit: props.limit } : {}),
-    ...(props.page !== undefined
-      ? { offset: (props.page - 1) * props.limit }
-      : {}),
-    ...(fromTimeFilter
-      ? {
-          cteFromTimeFilter: convertDateToClickhouseDateTime(
-            fromTimeFilter.value,
-          ),
-        }
-      : {}),
-    ...(toTimeFilter && propagateObservationsTimeBounds
-      ? {
-          cteToTimeFilter: convertDateToClickhouseDateTime(toTimeFilter.value),
-        }
-      : {}),
+const getSortColumn = (column?: string | null) => {
+  const map: Record<string, string> = {
+    id: "lt.id",
+    timestamp: "lt.timestamp",
+    name: "lt.name",
+    userId: "lt.user_id",
+    release: "lt.release",
+    version: "lt.version",
+    public: "lt.public",
+    bookmarked: "lt.bookmarked",
+    sessionId: "lt.session_id",
   };
+  if (!column) return "lt.timestamp";
 
-  return { query, params, fromTimeFilter };
-}
+  const mappedColumn = map[column];
+  if (!mappedColumn) {
+    throw new InvalidRequestError(
+      `Unsupported orderBy column "${column}". Supported columns: ${Object.keys(map).join(", ")}`,
+    );
+  }
+
+  return mappedColumn;
+};
+
+const getSortDirection = (order?: string | null) =>
+  order?.toUpperCase() === "ASC" ? "ASC" : "DESC";
+
+const buildBaseFilters = (props: TraceQueryType) => {
+  const clauses: Prisma.Sql[] = [
+    Prisma.sql`t.project_id = ${props.projectId}`,
+    Prisma.sql`t.is_deleted = false`,
+  ];
+
+  if (props.userId) clauses.push(Prisma.sql`t.user_id = ${props.userId}`);
+  if (props.name) clauses.push(Prisma.sql`t.name = ${props.name}`);
+  if (props.sessionId)
+    clauses.push(Prisma.sql`t.session_id = ${props.sessionId}`);
+  if (props.version) clauses.push(Prisma.sql`t.version = ${props.version}`);
+  if (props.release) clauses.push(Prisma.sql`t.release = ${props.release}`);
+  if (props.fromTimestamp)
+    clauses.push(Prisma.sql`t.timestamp >= ${new Date(props.fromTimestamp)}`);
+  if (props.toTimestamp)
+    clauses.push(Prisma.sql`t.timestamp <= ${new Date(props.toTimestamp)}`);
+
+  const tags = normalizeStringArray(props.tags);
+  if (tags.length > 0) {
+    clauses.push(Prisma.sql`t.tags && ${tags}`);
+  }
+
+  const environments = normalizeStringArray(props.environment);
+  if (environments.length === 1) {
+    clauses.push(Prisma.sql`t.environment = ${environments[0]}`);
+  } else if (environments.length > 1) {
+    clauses.push(Prisma.sql`t.environment IN (${Prisma.join(environments)})`);
+  }
+
+  return clauses;
+};
+
+export const getTracesCountForPublicApi = async ({
+  props,
+  advancedFilters,
+}: {
+  props: TraceQueryType;
+  advancedFilters?: FilterState;
+}): Promise<number> => {
+  if (advancedFilters?.length) {
+    logger.warn(
+      "Public traces advancedFilters are currently ignored in PostgreSQL mode",
+      { projectId: props.projectId },
+    );
+  }
+
+  const whereSql = Prisma.join(buildBaseFilters(props), " AND ");
+  const rows = await tracingPrisma.$queryRaw<
+    Array<{ count: bigint }>
+  >(Prisma.sql`
+    WITH latest_traces AS (
+      SELECT DISTINCT ON (t.id, t.project_id) t.id, t.project_id
+      FROM clickhouse.traces t
+      WHERE ${whereSql}
+      ORDER BY t.id, t.project_id, t.event_ts DESC
+    )
+    SELECT count(*)::bigint as count
+    FROM latest_traces
+  `);
+
+  return Number(rows[0]?.count ?? 0n);
+};
 
 export const generateTracesForPublicApi = async ({
   props,
@@ -317,153 +190,106 @@ export const generateTracesForPublicApi = async ({
   props: TraceQueryType;
   advancedFilters?: FilterState;
   orderBy: OrderByState;
-}) => {
-  const requestedFields = props.fields ?? TRACE_FIELD_GROUPS;
-  const includeIO = requestedFields.includes("io");
-  const includeScores = requestedFields.includes("scores");
-  const includeObservations = requestedFields.includes("observations");
-  const includeMetrics = requestedFields.includes("metrics");
-
-  const { query, params, fromTimeFilter } = await buildTracesBaseQuery(
-    props,
-    {
-      includeIO,
-      includeObservations,
-      includeMetrics,
-      includeScores,
-      count: false,
-    },
-    advancedFilters,
-    orderBy,
-  );
-  const result = await measureAndReturn({
-    operationName: "getTracesForPublicApi",
-    projectId: props.projectId,
-    input: {
-      params,
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "public-api",
-        projectId: props.projectId,
-        operation_name: "getTracesForPublicApi",
-      },
-      fromTimestamp: fromTimeFilter?.value ?? undefined,
-      preferredClickhouseService: "ReadOnly",
-    },
-    fn: (input) => {
-      return queryClickhouse<
-        TraceRecordReadType & {
-          observations?: string[];
-          scores?: string[];
-          totalCost?: number;
-          latency?: number;
-          htmlPath: string;
-        }
-      >({
-        query,
-        params: input.params,
-        tags: input.tags,
-        preferredClickhouseService: "ReadOnly",
-      });
-    },
-  });
-
-  return convertClickhouseTracesListToDomain(result, {
-    metrics: includeMetrics,
-    scores: includeScores,
-    observations: includeObservations,
-  });
-};
-
-export const getTracesCountForPublicApi = async ({
-  props,
-  advancedFilters,
-}: {
-  props: TraceQueryType;
-  advancedFilters?: FilterState;
-}) => {
-  let filter = deriveFilters(
-    props,
-    filterParams,
-    advancedFilters,
-    tracesTableUiColumnDefinitions,
-  );
-  const appliedFilter = filter.apply();
-
-  let query = `
-    SELECT count() as count
-    FROM __TRACE_TABLE__ t
-    WHERE project_id = {projectId: String}
-    ${filter.length() > 0 ? `AND ${appliedFilter.query}` : ""}
-  `;
-
-  let params: Record<string, any> = {
-    ...appliedFilter.params,
-    projectId: props.projectId,
-  };
-
-  if (advancedFilters !== undefined && advancedFilters.length > 0) {
-    ({ query, params } = await buildTracesBaseQuery(
-      props,
-      {
-        includeObservations: false,
-        includeIO: false,
-        includeMetrics: false,
-        includeScores: false,
-        count: true,
-      },
-      advancedFilters,
-    ));
+}): Promise<PublicApiTrace[]> => {
+  if (advancedFilters?.length) {
+    logger.warn(
+      "Public traces advancedFilters are currently ignored in PostgreSQL mode",
+      { projectId: props.projectId },
+    );
   }
 
-  const timestamp = props.fromTimestamp
-    ? new Date(props.fromTimestamp)
-    : undefined;
+  const whereSql = Prisma.join(buildBaseFilters(props), " AND ");
+  const sortColumn = getSortColumn(orderBy?.column ?? null);
+  const sortDirection = getSortDirection(orderBy?.order ?? null);
+  const orderSql = Prisma.raw(
+    `${sortColumn} ${sortDirection}, lt.id ASC, lt.project_id ASC`,
+  );
+  const offset = (props.page - 1) * props.limit;
 
-  return measureAndReturn({
-    operationName: "getTracesCountForPublicApi",
-    projectId: props.projectId,
-    input: {
-      params,
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "count",
-        projectId: props.projectId,
-        operation_name: "getTracesCountForPublicApi",
-      },
-      timestamp,
-    },
-    fn: async (input) => {
-      const records = await queryClickhouse<{ count: string }>({
-        query: query.replace("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: input.tags,
-        preferredClickhouseService: "ReadOnly",
-      });
-      return records.map((record) => Number(record.count)).shift();
-    },
-  });
+  const rows = await tracingPrisma.$queryRaw<PublicTraceRow[]>(Prisma.sql`
+    WITH latest_traces AS (
+      SELECT DISTINCT ON (t.id, t.project_id)
+        t.id,
+        t.project_id,
+        t.timestamp,
+        t.name,
+        t.user_id,
+        t.metadata,
+        t.release,
+        t.version,
+        t.environment,
+        t.public,
+        t.bookmarked,
+        t.tags,
+        t.input,
+        t.output,
+        t.session_id,
+        t.created_at,
+        t.updated_at
+      FROM clickhouse.traces t
+      WHERE ${whereSql}
+      ORDER BY t.id, t.project_id, t.event_ts DESC
+    ),
+    observation_stats AS (
+      SELECT
+        o.trace_id,
+        array_agg(o.id) as observations,
+        SUM(o.total_cost)::double precision as total_cost,
+        EXTRACT(EPOCH FROM (MAX(COALESCE(o.end_time, o.start_time)) - MIN(o.start_time)))::double precision as latency_seconds
+      FROM clickhouse.observations o
+      INNER JOIN latest_traces lt
+        ON lt.id = o.trace_id
+        AND lt.project_id = o.project_id
+      GROUP BY o.trace_id
+    ),
+    score_stats AS (
+      SELECT
+        s.trace_id,
+        array_agg(s.id) as scores
+      FROM clickhouse.scores s
+      INNER JOIN latest_traces lt
+        ON lt.id = s.trace_id
+        AND lt.project_id = s.project_id
+      WHERE s.session_id IS NULL
+        AND s.dataset_run_id IS NULL
+      GROUP BY s.trace_id
+    )
+    SELECT
+      lt.*,
+      os.observations,
+      ss.scores,
+      os.total_cost,
+      os.latency_seconds
+    FROM latest_traces lt
+    LEFT JOIN observation_stats os ON os.trace_id = lt.id
+    LEFT JOIN score_stats ss ON ss.trace_id = lt.id
+    ORDER BY ${orderSql}
+    LIMIT ${props.limit}
+    OFFSET ${offset}
+  `);
+
+  return rows.map((row: PublicTraceRow) => ({
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    timestamp: row.timestamp,
+    environment: row.environment ?? "default",
+    tags: row.tags ?? [],
+    bookmarked: row.bookmarked,
+    release: row.release,
+    version: row.version,
+    userId: row.user_id,
+    sessionId: row.session_id,
+    public: row.public,
+    input: parseMaybeJson(row.input),
+    output: parseMaybeJson(row.output),
+    metadata: row.metadata ?? {},
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    observations: row.observations ?? [],
+    scores: row.scores ?? [],
+    totalCost: row.total_cost ?? 0,
+    latency: row.latency_seconds ?? 0,
+    htmlPath: `/project/${row.project_id}/traces/${row.id}`,
+  }));
 };
-
-const orderByColumns = [
-  "id",
-  "timestamp",
-  "name",
-  "userId",
-  "release",
-  "version",
-  "public",
-  "bookmarked",
-  "sessionId",
-].map((name) => ({
-  uiTableName: name,
-  uiTableId: name,
-  clickhouseTableName: "traces",
-  clickhouseSelect: snakeCase(name),
-  queryPrefix: "t",
-}));
-
-// Use factory functions to create column mappings (eliminates duplication with events table)
-const filterParams = createPublicApiTracesColumnMapping("traces", "t");

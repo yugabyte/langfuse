@@ -139,6 +139,34 @@ export default withMiddlewares({
         throw new Error("Failed to create dataset run item");
       }
 
+      // Ensure dataset run items are queryable in YB-only deployments where
+      // clickhouse.dataset_run_items* tables may not exist.
+      await prisma.datasetRunItems.upsert({
+        where: {
+          id_projectId: {
+            id: runItemId,
+            projectId: auth.scope.projectId,
+          },
+        },
+        create: {
+          id: runItemId,
+          projectId: auth.scope.projectId,
+          datasetRunId: run.id,
+          datasetItemId: datasetItem.id,
+          traceId: finalTraceId,
+          observationId: observationId ?? null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+        update: {
+          datasetRunId: run.id,
+          datasetItemId: datasetItem.id,
+          traceId: finalTraceId,
+          observationId: observationId ?? null,
+          updatedAt: createdAt,
+        },
+      });
+
       /********************
        * ASYNC RUN ITEM EVAL *
        ********************/

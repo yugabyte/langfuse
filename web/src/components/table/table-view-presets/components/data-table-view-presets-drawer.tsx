@@ -52,8 +52,8 @@ import {
   type OrderByState,
   type FilterState,
   type TableViewPresetTableName,
-  type TableViewPresetState,
 } from "@langfuse/shared";
+import type { TableViewPresetState } from "@/src/components/table/table-view-presets/types";
 import { useCallback, useMemo, useState } from "react";
 import {
   DropdownMenuItem,

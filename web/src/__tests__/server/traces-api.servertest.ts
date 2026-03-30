@@ -525,11 +525,21 @@ describe("/api/public/traces API Endpoint", () => {
     expect(trace2.name).toBe("trace-name1");
   });
 
-  it("should return 400 error when page=0", async () => {
+  it("should return 400 error when limit=0", async () => {
     const response = await makeZodVerifiedAPICallSilent(
       GetTracesV1Response,
       "GET",
-      "/api/public/traces?page=0&limit=10",
+      "/api/public/traces?page=1&limit=0",
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("should return 400 error when orderBy column is unsupported", async () => {
+    const response = await makeZodVerifiedAPICallSilent(
+      GetTracesV1Response,
+      "GET",
+      "/api/public/traces?orderBy=unknownColumn.desc",
     );
 
     expect(response.status).toBe(400);

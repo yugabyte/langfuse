@@ -5,12 +5,7 @@ import {
   AGGREGATABLE_SCORE_TYPES,
   AggregatableScoreDataType,
 } from "../../domain/scores";
-import {
-  commandClickhouse,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
+import { queryClickhouse, queryClickhouseStream } from "./clickhouse";
 import { FilterList, orderByToClickhouseSql } from "../queries";
 import { FilterCondition, FilterState, TimeFilter } from "../../types";
 import {
@@ -28,7 +23,6 @@ import {
   convertClickhouseScoreToDomain,
   ScoreAggregation,
 } from "./scores_converters";
-import { SCORE_TO_TRACE_OBSERVATIONS_INTERVAL } from "./constants";
 import {
   convertDateToClickhouseDateTime,
   PreferredClickhouseService,
@@ -42,7 +36,6 @@ import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { recordDistribution } from "../instrumentation";
 import { prisma as metadataPrisma, tracingPrisma as prisma } from "../../db";
 import { measureAndReturn } from "../clickhouse/measureAndReturn";
-import { scoresColumnsTableUiColumnDefinitions } from "../tableMappings/mapScoresColumnsTable";
 import { eventsTraceMetadata } from "../queries/clickhouse-sql/query-fragments";
 import { Prisma } from "@prisma/client";
 import { logger } from "../logger";
@@ -342,7 +335,7 @@ export const getScoresForSessions = async <
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
       FROM scores s
       WHERE s.project_id = ${projectId}
@@ -398,7 +391,7 @@ export const getScoresForDatasetRuns = async <
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
       FROM scores s
       WHERE s.project_id = ${projectId}
@@ -447,7 +440,7 @@ export const getTraceScoresForDatasetRuns = async (
     WITH ranked AS (
       SELECT
         s.*,
-        CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END AS has_metadata,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
         dri.dataset_run_id as run_id,
         ROW_NUMBER() OVER (
           PARTITION BY s.id, s.project_id, dri.dataset_run_id
@@ -493,10 +486,10 @@ const getScoresForTracesInternal = async <
     dataTypes,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   } = props;
 
   const tsLowerBound = timestamp
@@ -607,7 +600,7 @@ export const getScoresForObservations = async <
     observationIds,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
   } = props;
@@ -623,7 +616,7 @@ export const getScoresForObservations = async <
       s.*,
       ${
         includeHasMetadata
-          ? Prisma.sql`CASE WHEN jsonb_object_length(COALESCE(s.metadata, '{}'::jsonb)) > 0 THEN 1 ELSE 0 END`
+          ? Prisma.sql`CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END`
           : Prisma.sql`0`
       } AS has_metadata
     FROM scores s
@@ -666,7 +659,7 @@ export const getScoresForObservations = async <
 
 export const getScoresGroupedByNameSourceType = async ({
   projectId,
-  filter,
+  filter: _filter,
   fromTimestamp,
   toTimestamp,
 }: {

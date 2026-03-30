@@ -560,13 +560,7 @@ export default function SignIn({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initUserEmail, initUserPassword]);
 
-  if (initUserEmail && initUserPassword) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="text-center text-muted-foreground">Signing in...</div>
-      </div>
-    );
-  }
+  const isAutoSigningIn = Boolean(initUserEmail && initUserPassword);
 
   // handle NextAuth error codes: https://next-auth.js.org/configuration/pages#sign-in-page
   const nextAuthError =
@@ -746,6 +740,14 @@ export default function SignIn({
     } finally {
       setContinueLoading(false);
     }
+  }
+
+  if (isAutoSigningIn) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <div className="text-center text-muted-foreground">Signing in...</div>
+      </div>
+    );
   }
 
   return (

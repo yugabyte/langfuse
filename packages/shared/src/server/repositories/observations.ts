@@ -1,34 +1,17 @@
-import {
-  parseClickhouseUTCDateTimeFormat,
-  upsertClickhouse,
-} from "./clickhouse";
+import { parseClickhouseUTCDateTimeFormat } from "./clickhouse";
 import { logger } from "../logger";
 import { InternalServerError, LangfuseNotFoundError } from "../../errors";
 import { tracingPrisma as prisma } from "../../db";
 import { ObservationRecordReadType } from "./definitions";
 import { FilterState } from "../../types";
-import {
-  DateTimeFilter,
-  FilterList,
-  StringFilter,
-  FullObservations,
-  orderByToClickhouseSql,
-} from "../queries";
-import { createFilterFromFilterState } from "../queries/clickhouse-sql/factory";
-import {
-  observationsTableTraceUiColumnDefinitions,
-  observationsTableUiColumnDefinitions,
-} from "../tableMappings";
+import { FullObservations } from "../queries";
 import { OrderByState } from "../../interfaces/orderBy";
 import { getTracesByIds } from "./traces";
-import { measureAndReturn } from "../clickhouse/measureAndReturn";
 import { PreferredClickhouseService } from "../clickhouse/client";
 import {
   convertObservation,
   enrichObservationWithModelData,
 } from "./observations_converters";
-import { clickhouseSearchCondition } from "../queries/clickhouse-sql/search";
-import { OBSERVATIONS_TO_TRACE_INTERVAL } from "./constants";
 import { env } from "../../env";
 import { TracingSearchType } from "../../interfaces/search";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
@@ -36,7 +19,6 @@ import type { AnalyticsGenerationEvent } from "../analytics-integrations/types";
 import { ObservationType } from "../../domain";
 import { recordDistribution } from "../instrumentation";
 import { DEFAULT_RENDERING_PROPS, RenderingProps } from "../utils/rendering";
-import { shouldSkipObservationsFinal } from "../queries/clickhouse-sql/query-options";
 import { Prisma } from "@prisma/client";
 
 const toClickhouseDateTimeString = (value: Date | null | undefined) =>
@@ -321,7 +303,7 @@ export const getObservationsForTrace = async <IncludeIO extends boolean>(
     projectId,
     timestamp,
     includeIO = false,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   } = opts;
 
   const recordsRaw = await prisma.$queryRaw<PgObservationRow[]>(Prisma.sql`
@@ -423,7 +405,7 @@ export const getObservationById = async ({
   type,
   traceId,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  preferredClickhouseService,
+  preferredClickhouseService: _preferredClickhouseService,
 }: {
   id: string;
   projectId: string;
@@ -442,7 +424,7 @@ export const getObservationById = async ({
     type,
     traceId,
     renderingProps,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   });
   const mapped = records.map((record) =>
     convertObservation(record, renderingProps),
@@ -498,7 +480,7 @@ const getObservationByIdInternal = async ({
   type,
   traceId,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  preferredClickhouseService,
+  preferredClickhouseService: _preferredClickhouseService,
 }: {
   id: string;
   projectId: string;
@@ -877,7 +859,7 @@ const getObservationsTableInternal = async <T>(
       o.internal_model_id,
       (EXTRACT(EPOCH FROM (COALESCE(o.end_time, o.start_time) - o.start_time)) * 1000)::text AS latency,
       (EXTRACT(EPOCH FROM (COALESCE(o.completion_start_time, o.start_time) - o.start_time)) * 1000)::text AS time_to_first_token,
-      jsonb_object_length(COALESCE(o.tool_definitions, '{}'::jsonb))::text AS tool_definitions_count,
+      (SELECT count(*) FROM jsonb_object_keys(COALESCE(o.tool_definitions, '{}'::jsonb)))::text AS tool_definitions_count,
       jsonb_array_length(COALESCE(o.tool_calls, '[]'::jsonb))::text AS tool_calls_count
       ${opts.selectIOAndMetadata ? Prisma.sql`, o.input, o.output, o.metadata` : Prisma.empty}
     ${fromWithJoin}

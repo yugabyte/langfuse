@@ -1,14 +1,8 @@
 import { VERSION } from "@/src/constants";
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
 import { telemetry } from "@/src/features/telemetry";
-import { prisma } from "@langfuse/shared/src/db";
-import {
-  convertDateToClickhouseDateTime,
-  logger,
-  measureAndReturn,
-  queryClickhouse,
-  traceException,
-} from "@langfuse/shared/src/server";
+import { Prisma, prisma } from "@langfuse/shared/src/db";
+import { logger, traceException } from "@langfuse/shared/src/server";
 import { type NextApiRequest, type NextApiResponse } from "next";
 
 export default async function handler(
@@ -38,45 +32,24 @@ export default async function handler(
     try {
       if (failIfNoRecentEvents) {
         const now = new Date();
-        const traces = await measureAndReturn({
-          operationName: "healthCheckTraces",
-          projectId: "__CROSS_PROJECT__",
-          input: {
-            now: convertDateToClickhouseDateTime(now),
-          },
-          fn: async (input: { now: string }) => {
-            return queryClickhouse<{ id: string }>({
-              query: `
-                SELECT id
-                FROM traces
-                WHERE timestamp <= {now: DateTime64(3)}
-                AND timestamp >= {now: DateTime64(3)} - INTERVAL 3 MINUTE
-                LIMIT 1
-              `,
-              params: input,
-              tags: {
-                feature: "health-check",
-                type: "trace",
-              },
-            });
-          },
-        });
-        const observations = await queryClickhouse({
-          query: `
-            SELECT id
-            FROM observations
-            WHERE start_time <= {now: DateTime64(3)}
-            AND start_time >= {now: DateTime64(3)} - INTERVAL 3 MINUTE
+        const [traces, observations] = await Promise.all([
+          prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+            SELECT t.id
+            FROM clickhouse.traces t
+            WHERE t.timestamp <= ${now}
+              AND t.timestamp >= ${new Date(now.getTime() - 3 * 60 * 1000)}
+              AND t.is_deleted = false
             LIMIT 1
-          `,
-          params: {
-            now: convertDateToClickhouseDateTime(now),
-          },
-          tags: {
-            feature: "health-check",
-            type: "observation",
-          },
-        });
+          `),
+          prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+            SELECT o.id
+            FROM clickhouse.observations o
+            WHERE o.start_time <= ${now}
+              AND o.start_time >= ${new Date(now.getTime() - 3 * 60 * 1000)}
+              AND o.is_deleted = false
+            LIMIT 1
+          `),
+        ]);
         if (traces.length === 0 || observations.length === 0) {
           return res.status(503).json({
             status: `No ${
