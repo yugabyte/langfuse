@@ -28,6 +28,7 @@ const cloudAllPlansEntitlements: Entitlement[] = [
 const selfHostedAllPlansEntitlements: Entitlement[] = [
   "trace-deletion",
   "scheduled-blob-exports",
+  "admin-api",
 ];
 
 // Entitlement Limits: Limits on the number of resources that can be created/used
