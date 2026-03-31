@@ -213,7 +213,10 @@ export default async function handler(
           name: name?.formatted || displayName,
           password: password ? await hashPassword(password) : undefined,
         },
-        update: {},
+        update: {
+          name: name?.formatted || displayName,
+          ...(password ? { password: await hashPassword(password) } : {}),
+        },
       });
       await prisma.organizationMembership.create({
         data: {
