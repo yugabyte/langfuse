@@ -54,14 +54,14 @@ export function getOrganizationPlanServerSide(
   return "oss";
 }
 
-export function getSelfHostedInstancePlanServerSide(): Plan | null {
+export function getSelfHostedInstancePlanServerSide(): Plan {
   const licenseKey = env.LANGFUSE_EE_LICENSE_KEY;
-  if (!licenseKey) return null;
+  if (!licenseKey) return "oss";
   if (licenseKey.startsWith("langfuse_ee_")) {
     return "self-hosted:enterprise";
   }
   if (licenseKey.startsWith("langfuse_pro_")) {
     return "self-hosted:pro";
   }
-  return null;
+  return "oss";
 }

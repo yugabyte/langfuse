@@ -164,6 +164,9 @@ const EnvSchema = z.object({
   LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG: z
     .enum(["true", "false"])
     .default("true"),
+  LANGFUSE_DISABLE_CLICKHOUSE_WRITES: z
+    .enum(["true", "false"])
+    .default("false"),
 
   LANGFUSE_S3_LIST_MAX_KEYS: z.coerce.number().positive().default(200),
   LANGFUSE_S3_RATE_ERROR_SLOWDOWN_ENABLED: z

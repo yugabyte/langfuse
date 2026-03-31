@@ -39,6 +39,7 @@ export const projectDeleteProcessor: Processor = async (
   job: Job<TQueueJobTypes[QueueName.ProjectDelete]>,
 ): Promise<void> => {
   const { orgId, projectId } = job.data.payload;
+  const clickhouseEnabled = env.LANGFUSE_DISABLE_CLICKHOUSE_WRITES !== "true";
 
   const span = getCurrentSpan();
   if (span) {
@@ -79,12 +80,12 @@ export const projectDeleteProcessor: Processor = async (
   }
 
   logger.info(
-    `Deleting ClickHouse and S3 data for ${projectId} in org ${orgId}`,
+    `Deleting tracing store and S3 data for ${projectId} in org ${orgId} (clickhouseEnabled=${clickhouseEnabled})`,
   );
 
   // Delete project data from ClickHouse first
   await Promise.all([
-    env.LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"
+    env.LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true" && clickhouseEnabled
       ? removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject(
           projectId,
           undefined,
@@ -93,13 +94,16 @@ export const projectDeleteProcessor: Processor = async (
     deleteTracesByProjectId(projectId),
     deleteObservationsByProjectId(projectId),
     deleteScoresByProjectId(projectId),
+    clickhouseEnabled &&
     env.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE === "true"
       ? deleteEventsByProjectId(projectId)
       : Promise.resolve(),
   ]);
 
-  // Trigger async delete of dataset run items
-  await deleteDatasetRunItemsByProjectId(projectId);
+  // Dataset run items are stored in ClickHouse-backed tables.
+  if (clickhouseEnabled) {
+    await deleteDatasetRunItemsByProjectId(projectId);
+  }
 
   logger.info(`Deleting PG data for project ${projectId} in org ${orgId}`);
 
