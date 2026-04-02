@@ -6,12 +6,7 @@
 services:
 
   langfuse-web:
-    image: langfuse-web:local
-    build:
-      context: .
-      dockerfile: web/Dockerfile
-      cache_from:
-        - langfuse-web:local
+    image: kushyb/meko-lf-web:latest
     container_name: ${WEB_CONTAINER_NAME:-langfuse-web}
     restart: unless-stopped
     # Keep web decoupled from worker for faster local iteration.
@@ -123,12 +118,7 @@ services:
       - default
 
   langfuse-worker:
-    image: langfuse-worker:local
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-      cache_from:
-        - langfuse-worker:local
+    image: kushyb/meko-lf-worker:latest
     container_name: ${WORKER_CONTAINER_NAME:-langfuse-worker}
     restart: unless-stopped
     depends_on:
