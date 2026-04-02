@@ -1,9 +1,9 @@
 import {
   BookOpen,
-  LockIcon,
+  // LockIcon,
   MessageSquareText,
-  Settings,
-  Users,
+  // Settings,
+  // Users,
 } from "lucide-react";
 import {
   Card,
@@ -16,19 +16,19 @@ import {
 import { Separator } from "@/src/components/ui/separator";
 import Header from "@/src/components/layouts/header";
 import { Button } from "@/src/components/ui/button";
-import { PlusIcon } from "lucide-react";
+// import { PlusIcon } from "lucide-react";
 import Link from "next/link";
 import { StringParam, useQueryParams } from "use-query-params";
 import { Input } from "@/src/components/ui/input";
-import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
+// import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { env } from "@/src/env.mjs";
 import { Fragment } from "react";
 import { useRouter } from "next/router";
 import { useSession } from "next-auth/react";
-import {
-  createOrganizationRoute,
-  createProjectRoute,
-} from "@/src/features/setup/setupRoutes";
+// import {
+//   createOrganizationRoute,
+//   createProjectRoute,
+// } from "@/src/features/setup/setupRoutes";
 import { isCloudPlan, planLabels } from "@langfuse/shared";
 import ContainerPage from "@/src/components/layouts/container-page";
 import { type User } from "next-auth";
@@ -56,13 +56,14 @@ const OrganizationProjectTiles = ({
             {!project.deletedAt ? (
               <CardFooter className="gap-2">
                 <Button asChild variant="secondary">
-                  <Link href={`/project/${project.id}`}>Go to project</Link>
+                  <Link href={`/project/${project.id}/traces`}>Go to project</Link>
                 </Button>
-                <Button asChild variant="ghost">
+                {/* Hidden in Meko embed: project settings entry point */}
+                {/* <Button asChild variant="ghost">
                   <Link href={`/project/${project.id}/settings`}>
                     <Settings size={16} />
                   </Link>
-                </Button>
+                </Button> */}
               </CardFooter>
             ) : (
               <CardContent>
@@ -103,30 +104,34 @@ const OrganizationActionButtons = ({
   orgId: string;
   primaryButtonVariant?: "default" | "secondary";
 }) => {
-  const membersViewAccess = useHasOrganizationAccess({
-    organizationId: orgId,
-    scope: "organizationMembers:read",
-  });
-  const createProjectAccess = useHasOrganizationAccess({
-    organizationId: orgId,
-    scope: "projects:create",
-  });
+  // Hidden in Meko embed: disable org/project management actions.
+  // const membersViewAccess = useHasOrganizationAccess({
+  //   organizationId: orgId,
+  //   scope: "organizationMembers:read",
+  // });
+  // const createProjectAccess = useHasOrganizationAccess({
+  //   organizationId: orgId,
+  //   scope: "projects:create",
+  // });
 
   return (
     <>
-      <Button asChild variant="ghost">
+      {/* Hidden in Meko embed: organization settings entry point */}
+      {/* <Button asChild variant="ghost">
         <Link href={`/organization/${orgId}/settings`}>
           <Settings size={14} />
         </Link>
-      </Button>
-      {membersViewAccess && (
+      </Button> */}
+      {/* Hidden in Meko embed: members/settings entry point */}
+      {/* {membersViewAccess && (
         <Button asChild variant="ghost">
           <Link href={`/organization/${orgId}/settings/members`}>
             <Users size={14} />
           </Link>
         </Button>
-      )}
-      {createProjectAccess ? (
+      )} */}
+      {/* Hidden in Meko embed: project creation from org page */}
+      {/* {createProjectAccess ? (
         <Button asChild variant={primaryButtonVariant}>
           <Link href={createProjectRoute(orgId)}>
             <PlusIcon className="mr-2 h-4 w-4" aria-hidden="true" />
@@ -138,7 +143,7 @@ const OrganizationActionButtons = ({
           <LockIcon className="mr-2 h-4 w-4" aria-hidden="true" />
           New project
         </Button>
-      )}
+      )} */}
     </>
   );
 };
@@ -241,7 +246,8 @@ export const OrganizationProjectOverview = () => {
   const router = useRouter();
   const queryOrgId = router.query.organizationId;
   const session = useSession();
-  const canCreateOrg = session.data?.user?.canCreateOrganizations;
+  // Hidden in Meko embed: organization creation disabled.
+  // const canCreateOrg = session.data?.user?.canCreateOrganizations;
   const organizations = session.data?.user?.organizations;
   const [{ search }, setQueryParams] = useQueryParams({ search: StringParam });
 
@@ -287,14 +293,15 @@ export const OrganizationProjectOverview = () => {
               placeholder="Search projects"
               onChange={(e) => setQueryParams({ search: e.target.value })}
             />
-            {canCreateOrg && (
+            {/* Hidden in Meko embed: new organization creation */}
+            {/* {canCreateOrg && (
               <Button data-testid="create-organization-btn" asChild>
                 <Link href={createOrganizationRoute}>
                   <PlusIcon className="mr-1.5 h-4 w-4" aria-hidden="true" />
                   New Organization
                 </Link>
               </Button>
-            )}
+            )} */}
           </>
         ),
       }}
@@ -342,14 +349,15 @@ const Onboarding = () => {
         </CardDescription>
       </CardContent>
       <CardFooter className="flex gap-4">
-        {canCreateOrgs && (
+        {/* Hidden in Meko embed: onboarding org creation */}
+        {/* {canCreateOrgs && (
           <Button data-testid="create-project-btn" asChild>
             <Link href={createOrganizationRoute}>
               <PlusIcon className="mr-2 h-4 w-4" aria-hidden="true" />
               New Organization
             </Link>
           </Button>
-        )}
+        )} */}
         <Button variant="secondary" asChild>
           <Link href="https://langfuse.com/docs" target="_blank">
             <BookOpen className="mr-2 h-4 w-4" aria-hidden="true" />

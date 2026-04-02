@@ -27,20 +27,21 @@ type SidebarNotification = {
 };
 
 const notifications: SidebarNotification[] = [
-  {
-    id: "github-star",
-    title: "Star Langfuse",
-    description:
-      "See the latest releases and help grow the community on GitHub",
-    link: "https://github.com/langfuse/langfuse",
-    linkContent: (
-      // eslint-disable-next-line @next/next/no-img-element
-      <img
-        alt="Langfuse GitHub stars"
-        src="https://img.shields.io/github/stars/langfuse/langfuse?label=langfuse&style=social"
-      />
-    ),
-  },
+  // Hidden in Meko embed mode. Keep config commented for future restore.
+  // {
+  //   id: "github-star",
+  //   title: "Star Langfuse",
+  //   description:
+  //     "See the latest releases and help grow the community on GitHub",
+  //   link: "https://github.com/langfuse/langfuse",
+  //   linkContent: (
+  //     // eslint-disable-next-line @next/next/no-img-element
+  //     <img
+  //       alt="Langfuse GitHub stars"
+  //       src="https://img.shields.io/github/stars/langfuse/langfuse?label=langfuse&style=social"
+  //     />
+  //   ),
+  // },
 ];
 
 const STORAGE_KEY = "dismissed-sidebar-notifications";

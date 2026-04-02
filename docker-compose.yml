@@ -1,5 +1,10 @@
 # Make sure to update the credential placeholders with your own secrets.
 # We mark them with # CHANGEME in the file below.
+#
+# Meko Observe: UI iframe is http://localhost:5000/observe/embed/... ; meko-proxy maps that to Langfuse
+# basePath /observe on :3000. After changing NEXT_PUBLIC_BASE_PATH, rebuild:
+#   docker compose build --no-cache langfuse-web
+#
 # In addition, we recommend to restrict inbound traffic on the host to langfuse-web (port 3000) and minio (port 9090) only.
 # All other components are bound to localhost (127.0.0.1) to only accept connections from the local machine.
 # External connections from other machines will not be able to reach these services directly.
@@ -10,6 +15,9 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
+      args:
+        # Required when Langfuse is embedded in Meko under /observe/embed (Next.js basePath).
+        NEXT_PUBLIC_BASE_PATH: "${NEXT_PUBLIC_BASE_PATH:-/observe}"
       cache_from:
         - langfuse-web:local
     container_name: ${WEB_CONTAINER_NAME:-langfuse-web}
@@ -85,8 +93,8 @@ services:
       LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret}"
       LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
 
-      # Auth
-      NEXTAUTH_URL: "http://localhost:${WEB_HOST_PORT:-3000}"
+      # Auth — use Meko shell URL when Observe iframe is served from meko-proxy (port 5000).
+      NEXTAUTH_URL: "${NEXTAUTH_URL:-http://localhost:5000/observe}"
       NEXTAUTH_SECRET: "${NEXTAUTH_SECRET:-secret}"
       ADMIN_API_KEY: "${ADMIN_API_KEY:-meko-local-admin-key}"
 
@@ -101,6 +109,8 @@ services:
       # setting it triggers dd-trace at runtime, which is only installed
       # in the image when passed as a build ARG (not set for local builds).
       NEXT_PUBLIC_LANGFUSE_RUN_NEXT_INIT: "true"
+      # Runtime mirror of build arg (server / env validation); client bundle uses build-time value.
+      NEXT_PUBLIC_BASE_PATH: "${NEXT_PUBLIC_BASE_PATH:-/observe}"
 
       # Bootstrap user / org / projecti
       # TODO: this to to avoid the sign in/sign up step.
@@ -196,8 +206,8 @@ services:
       LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret}"
       LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
 
-      # App config
-      NEXTAUTH_URL: "http://localhost:${WEB_HOST_PORT:-3000}"
+      # App config (keep in sync with langfuse-web NEXTAUTH_URL)
+      NEXTAUTH_URL: "${NEXTAUTH_URL:-http://localhost:5000/observe}"
       ADMIN_API_KEY: "${ADMIN_API_KEY:-meko-local-admin-key}"
       SALT: "${SALT:-salt}"
       ENCRYPTION_KEY: "${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"
