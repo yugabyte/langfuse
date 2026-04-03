@@ -56,7 +56,9 @@ const OrganizationProjectTiles = ({
             {!project.deletedAt ? (
               <CardFooter className="gap-2">
                 <Button asChild variant="secondary">
-                  <Link href={`/project/${project.id}/traces`}>Go to project</Link>
+                  <Link href={`/project/${project.id}/traces`}>
+                    Go to project
+                  </Link>
                 </Button>
                 {/* Hidden in Meko embed: project settings entry point */}
                 {/* <Button asChild variant="ghost">

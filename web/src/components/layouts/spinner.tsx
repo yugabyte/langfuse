@@ -4,7 +4,7 @@ export function Spinner(props: { message: string }) {
   return (
     <div className="flex min-h-full flex-1 flex-col justify-center py-12 sm:px-6 lg:px-8">
       <div className="sm:mx-auto sm:w-full sm:max-w-md">
-        <LoaderCircle className="mx-auto h-10 w-10 motion-safe:animate-spin text-muted-foreground" />
+        <LoaderCircle className="mx-auto h-10 w-10 text-muted-foreground motion-safe:animate-spin" />
         <h2 className="mt-5 text-center text-2xl font-bold leading-9 tracking-tight text-primary">
           {props.message} ...
         </h2>

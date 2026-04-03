@@ -41,7 +41,11 @@ export type UserNavigationProps = {
   nonInteractive?: boolean;
 };
 
-export function NavUser({ user, items, nonInteractive = false }: UserNavigationProps) {
+export function NavUser({
+  user,
+  items,
+  nonInteractive = false,
+}: UserNavigationProps) {
   const { isMobile } = useSidebar();
 
   const initials = user.name
