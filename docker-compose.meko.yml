@@ -17,7 +17,7 @@ services:
       LANGFUSE_INIT_PROJECT_SECRET_KEY: ""
       LANGFUSE_INIT_USER_EMAIL: ""
       LANGFUSE_INIT_USER_NAME: ""
-      LANGFUSE_INIT_USER_PASWORD: ""
+      LANGFUSE_INIT_USER_PASSWORD: ""
 
   langfuse-worker:
     environment:
