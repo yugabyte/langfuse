@@ -95,6 +95,13 @@ async function removeIngestionEventsFromS3AndDeleteClickhouseRefs(p: {
 async function softDeleteInClickhouse(
   blobStorageRefs: BlobStorageFileRefRecordReadType[],
 ) {
+  if (
+    env.LANGFUSE_DISABLE_CLICKHOUSE_WRITES === "true" ||
+    blobStorageRefs.length === 0
+  ) {
+    return;
+  }
+
   await clickhouseClient().insert({
     table: "blob_storage_file_log",
     values: blobStorageRefs.map((e) => ({

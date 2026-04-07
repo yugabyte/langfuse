@@ -135,10 +135,7 @@ export const getEventsStream = async (props: {
       "s.scores_avg as scores_avg",
       "s.score_categories as score_categories",
     )
-    .withCTE(
-      "scores_agg",
-      eventsScoresAggregation({ projectId, categoricalEncoding: "tuple" }),
-    )
+    .withCTE("scores_agg", eventsScoresAggregation({ projectId }))
     .leftJoin(
       "scores_agg s",
       "ON s.trace_id = e.trace_id AND s.observation_id = e.span_id",

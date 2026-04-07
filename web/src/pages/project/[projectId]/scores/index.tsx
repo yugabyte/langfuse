@@ -1,4 +1,5 @@
 import { useRouter } from "next/router";
+import { useEffect } from "react";
 import ScoresTable from "@/src/components/table/use-cases/scores";
 import Page from "@/src/components/layouts/page";
 import { api } from "@/src/utils/api";
@@ -7,10 +8,21 @@ import {
   getScoresTabs,
   SCORES_TABS,
 } from "@/src/features/navigation/utils/scores-tabs";
+import { SCORES_PAGE_ENABLED } from "@/src/features/scores/scores-page-config";
 
 export default function ScoresPage() {
   const router = useRouter();
   const projectId = router.query.projectId as string;
+
+  useEffect(() => {
+    if (!SCORES_PAGE_ENABLED && projectId) {
+      router.replace(`/project/${projectId}/traces`);
+    }
+  }, [projectId, router]);
+
+  if (!SCORES_PAGE_ENABLED) {
+    return null;
+  }
 
   // Check if the user has any scores
   const { data: hasAnyScore, isLoading } = api.scores.hasAny.useQuery(

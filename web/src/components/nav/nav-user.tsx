@@ -38,9 +38,14 @@ export type UserNavigationProps = {
     avatar: string;
   };
   items: UserNavigationItem[];
+  nonInteractive?: boolean;
 };
 
-export function NavUser({ user, items }: UserNavigationProps) {
+export function NavUser({
+  user,
+  items,
+  nonInteractive = false,
+}: UserNavigationProps) {
   const { isMobile } = useSidebar();
 
   const initials = user.name
@@ -49,6 +54,30 @@ export function NavUser({ user, items }: UserNavigationProps) {
     .map((word) => word[0])
     .join("")
     .toUpperCase();
+
+  if (nonInteractive) {
+    return (
+      <SidebarMenu>
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            size="lg"
+            className="pointer-events-none hover:bg-transparent active:bg-transparent"
+          >
+            <Avatar className="h-8 w-8 rounded-lg">
+              <AvatarImage src={user.avatar} alt={user.name} />
+              <AvatarFallback className="rounded-lg">{initials}</AvatarFallback>
+            </Avatar>
+            <div className="grid flex-1 text-left text-sm leading-tight">
+              <span className="truncate font-semibold">{user.name}</span>
+              <span className="truncate text-xs" title={user.email}>
+                {user.email}
+              </span>
+            </div>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      </SidebarMenu>
+    );
+  }
 
   return (
     <SidebarMenu>

@@ -55,6 +55,7 @@ import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEnti
 import {
   type AgentGraphDataResponse,
   AgentGraphDataSchema,
+  LANGGRAPH_START_NODE_NAME,
 } from "@/src/features/trace-graph-view/types";
 import { env } from "@/src/env.mjs";
 import {
@@ -651,16 +652,37 @@ export const traceRouter = createTRPCRouter({
         chMaxStartTime,
       });
 
-      const result = records
-        .map((r) => {
-          const parsed = AgentGraphDataSchema.safeParse(r);
-          if (!parsed.success) {
+      const parsedRecords = records
+        .map((r) => AgentGraphDataSchema.safeParse(r))
+        .filter((parsed) => parsed.success)
+        .map((parsed) => parsed.data);
+
+      const hasAnyLangGraphData = parsedRecords.some(
+        (data) => data.step != null && data.node != null,
+      );
+      const hasExplicitStartNode = parsedRecords.some(
+        (data) => data.node === LANGGRAPH_START_NODE_NAME,
+      );
+
+      const result = parsedRecords
+        .map((data) => {
+          const hasLangGraphData = data.step != null && data.node != null;
+          const hasAgentData = data.type !== "EVENT"; // Include all types except EVENT
+
+          // When LangGraph metadata is present, ignore fallback observations.
+          if (hasAnyLangGraphData && !hasLangGraphData) {
             return null;
           }
 
-          const data = parsed.data;
-          const hasLangGraphData = data.step != null && data.node != null;
-          const hasAgentData = data.type !== "EVENT"; // Include all types except EVENT
+          // Hide the synthetic LangGraph wrapper if explicit start/end nodes exist.
+          if (
+            hasAnyLangGraphData &&
+            hasExplicitStartNode &&
+            data.node === "LangGraph" &&
+            !data.parent_observation_id
+          ) {
+            return null;
+          }
 
           if (hasLangGraphData) {
             return {

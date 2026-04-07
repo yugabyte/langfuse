@@ -1,32 +1,14 @@
 import { OrderByState } from "../../interfaces/orderBy";
-import { tracesTableUiColumnDefinitions } from "../tableMappings";
 import { FilterState } from "../../types";
-import {
-  StringFilter,
-  StringOptionsFilter,
-  DateTimeFilter,
-} from "../queries/clickhouse-sql/clickhouse-filter";
-import {
-  getProjectIdDefaultFilter,
-  createFilterFromFilterState,
-} from "../queries/clickhouse-sql/factory";
-import { orderByToClickhouseSql } from "../queries/clickhouse-sql/orderby-factory";
-import { clickhouseSearchCondition } from "../queries/clickhouse-sql/search";
 import { TraceRecordReadType } from "../repositories/definitions";
 import Decimal from "decimal.js";
 import { ScoreAggregate } from "../../features/scores";
-import {
-  OBSERVATIONS_TO_TRACE_INTERVAL,
-  SCORE_TO_TRACE_OBSERVATIONS_INTERVAL,
-  parseClickhouseUTCDateTimeFormat,
-  queryClickhouse,
-  reduceUsageOrCostDetails,
-} from "../repositories";
-import { measureAndReturn } from "../clickhouse/measureAndReturn";
+import { parseClickhouseUTCDateTimeFormat } from "../repositories";
 import { TracingSearchType } from "../../interfaces/search";
 import { ObservationLevelType, TraceDomain } from "../../domain";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
-import { shouldSkipObservationsFinal } from "../queries/clickhouse-sql/query-options";
+import { tracingPrisma as prisma } from "../../db";
+import { Prisma } from "@prisma/client";
 
 export type TracesTableReturnType = Pick<
   TraceRecordReadType,
@@ -103,12 +85,13 @@ export const convertToUiTableRows = (
 export const convertToUITableMetrics = (
   row: TracesTableMetricsClickhouseReturnType,
 ): Omit<TracesMetricsUiReturnType, "scores"> => {
-  const usageDetails = reduceUsageOrCostDetails(row.usage_details);
+  const usageDetails = row.usage_details ?? {};
 
   return {
     id: row.id,
     projectId: row.project_id,
-    latency: Number(row.latency),
+    // UI formatIntervalSeconds expects seconds; query path currently computes milliseconds.
+    latency: row.latency === null ? null : Number(row.latency) / 1000,
     promptTokens: BigInt(usageDetails.input ?? 0),
     completionTokens: BigInt(usageDetails.output ?? 0),
     totalTokens: BigInt(usageDetails.total ?? 0),
@@ -125,15 +108,18 @@ export const convertToUITableMetrics = (
       ]),
     ),
     observationCount: BigInt(row.observation_count ?? 0),
-    calculatedTotalCost: row.cost_details?.total
-      ? new Decimal(row.cost_details.total)
-      : null,
-    calculatedInputCost: row.cost_details?.input
-      ? new Decimal(row.cost_details.input)
-      : null,
-    calculatedOutputCost: row.cost_details?.output
-      ? new Decimal(row.cost_details.output)
-      : null,
+    calculatedTotalCost:
+      row.cost_details?.total !== undefined
+        ? new Decimal(row.cost_details.total)
+        : new Decimal(0),
+    calculatedInputCost:
+      row.cost_details?.input !== undefined
+        ? new Decimal(row.cost_details.input)
+        : new Decimal(0),
+    calculatedOutputCost:
+      row.cost_details?.output !== undefined
+        ? new Decimal(row.cost_details.output)
+        : new Decimal(0),
     level: row.level,
     debugCount: BigInt(row.debug_count ?? 0),
     warningCount: BigInt(row.warning_count ?? 0),
@@ -201,7 +187,9 @@ async function getTracesTableGeneric(
   props: FetchTracesTableProps,
 ): Promise<Array<SelectReturnTypeMap[keyof SelectReturnTypeMap]>>;
 
-async function getTracesTableGeneric(props: FetchTracesTableProps) {
+async function getTracesTableGeneric(
+  props: FetchTracesTableProps,
+): Promise<Array<SelectReturnTypeMap[keyof SelectReturnTypeMap]>> {
   const {
     select,
     projectId,
@@ -210,281 +198,237 @@ async function getTracesTableGeneric(props: FetchTracesTableProps) {
     limit,
     page,
     searchQuery,
-    searchType,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
   } = props;
+  const timestampFilters = filter.filter(
+    (f) => f.column === "timestamp" && f.type === "datetime",
+  ) as Array<{ operator: string; value: Date }>;
+  const timestampWhere: { gte?: Date; gt?: Date; lte?: Date; lt?: Date } = {};
+  for (const tf of timestampFilters) {
+    if (tf.operator === ">=") timestampWhere.gte = tf.value;
+    if (tf.operator === ">") timestampWhere.gt = tf.value;
+    if (tf.operator === "<=") timestampWhere.lte = tf.value;
+    if (tf.operator === "<") timestampWhere.lt = tf.value;
+  }
 
-  // OTel projects use immutable spans - no need for deduplication
-  const skipObservationsDedup = await shouldSkipObservationsFinal(projectId);
-
-  const { tracesFilter, scoresFilter, observationsFilter } =
-    getProjectIdDefaultFilter(projectId, { tracesPrefix: "t" });
-
-  tracesFilter.push(
-    ...createFilterFromFilterState(filter, tracesTableUiColumnDefinitions),
-  );
-
-  const traceIdFilter = tracesFilter.find(
-    (f) => f.clickhouseTable === "traces" && f.field === "id",
-  ) as StringFilter | StringOptionsFilter | undefined;
-
-  traceIdFilter
-    ? scoresFilter.push(
-        new StringOptionsFilter({
-          clickhouseTable: "scores",
-          field: "trace_id",
-          operator: "any of",
-          values:
-            traceIdFilter instanceof StringFilter
-              ? [traceIdFilter.value]
-              : traceIdFilter.values,
-        }),
+  const conditions: Prisma.Sql[] = [Prisma.sql`project_id = ${projectId}`];
+  if (timestampWhere.gte)
+    conditions.push(Prisma.sql`timestamp >= ${timestampWhere.gte}`);
+  if (timestampWhere.gt)
+    conditions.push(Prisma.sql`timestamp > ${timestampWhere.gt}`);
+  if (timestampWhere.lte)
+    conditions.push(Prisma.sql`timestamp <= ${timestampWhere.lte}`);
+  if (timestampWhere.lt)
+    conditions.push(Prisma.sql`timestamp < ${timestampWhere.lt}`);
+  if (searchQuery) {
+    const pattern = `%${searchQuery}%`;
+    conditions.push(Prisma.sql`
+      (
+        id ILIKE ${pattern}
+        OR COALESCE(name,'') ILIKE ${pattern}
+        OR COALESCE(user_id,'') ILIKE ${pattern}
+        OR COALESCE(session_id,'') ILIKE ${pattern}
       )
-    : null;
-  traceIdFilter
-    ? observationsFilter.push(
-        new StringOptionsFilter({
-          clickhouseTable: "observations",
-          field: "trace_id",
-          operator: "any of",
-          values:
-            traceIdFilter instanceof StringFilter
-              ? [traceIdFilter.value]
-              : traceIdFilter.values,
-        }),
-      )
-    : null;
+    `);
+  }
+  const sortDirection =
+    orderBy?.column === "timestamp" && orderBy.order?.toLowerCase() === "asc"
+      ? Prisma.sql`ASC`
+      : Prisma.sql`DESC`;
 
-  // for query optimisation, we have to add the timeseries filter to observations + scores as well
-  // stats show, that 98% of all observations have their start_time larger than trace.timestamp - 5 min
-  const timeStampFilter = tracesFilter.find(
-    (f) =>
-      f.field === "timestamp" && (f.operator === ">=" || f.operator === ">"),
-  ) as DateTimeFilter | undefined;
+  if (select === "count") {
+    const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      FROM traces
+      WHERE ${Prisma.join(conditions, " AND ")}
+    `);
+    const count = Number(rows[0]?.count ?? 0n);
+    return [{ count: String(count) }];
+  }
 
-  const requiresScoresJoin =
-    tracesFilter.find((f) => f.clickhouseTable === "scores") !== undefined ||
-    tracesTableUiColumnDefinitions.find(
-      (c) =>
-        c.uiTableName === orderBy?.column || c.uiTableId === orderBy?.column,
-    )?.clickhouseTableName === "scores";
+  const traces = await prisma.$queryRaw<
+    Array<{
+      id: string;
+      project_id: string;
+      timestamp: Date;
+      tags: string[] | null;
+      bookmarked: boolean;
+      name: string | null;
+      release: string | null;
+      version: string | null;
+      user_id: string | null;
+      environment: string | null;
+      session_id: string | null;
+      public: boolean;
+    }>
+  >(Prisma.sql`
+    SELECT
+      id,
+      project_id,
+      timestamp,
+      tags,
+      bookmarked,
+      name,
+      release,
+      version,
+      user_id,
+      environment,
+      session_id,
+      public
+    FROM traces
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY timestamp ${sortDirection}
+    ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+    ${page !== undefined && limit !== undefined ? Prisma.sql`OFFSET ${page * limit}` : Prisma.empty}
+  `);
 
-  const requiresObservationsJoin =
-    tracesFilter.find((f) => f.clickhouseTable === "observations") !==
-      undefined ||
-    tracesTableUiColumnDefinitions.find(
-      (c) =>
-        c.uiTableName === orderBy?.column || c.uiTableId === orderBy?.column,
-    )?.clickhouseTableName === "observations";
+  if (select === "rows") {
+    return traces.map((t) => ({
+      id: t.id,
+      project_id: t.project_id,
+      timestamp: t.timestamp.toISOString().replace("T", " ").replace("Z", ""),
+      tags: t.tags ?? [],
+      bookmarked: t.bookmarked,
+      name: t.name,
+      release: t.release,
+      version: t.version,
+      user_id: t.user_id,
+      environment: t.environment ?? "default",
+      session_id: t.session_id,
+      public: t.public,
+    }));
+  }
 
-  const tracesFilterRes = tracesFilter.apply();
-  const scoresFilterRes = scoresFilter.apply();
-  const observationFilterRes = observationsFilter.apply();
+  if (select === "identifiers") {
+    return traces.map((t) => ({
+      id: t.id,
+      projectId: t.project_id,
+      timestamp: t.timestamp.toISOString().replace("T", " ").replace("Z", ""),
+    }));
+  }
 
-  const observationsAndScoresCTE = `
-    WITH observations_stats AS (
-      SELECT
-        COUNT(*) AS observation_count,
-        sumMap(usage_details) as usage_details,
-        SUM(total_cost) AS total_cost,
-        date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds,
-        countIf(level = 'ERROR') as error_count,
-        countIf(level = 'WARNING') as warning_count,
-        countIf(level = 'DEFAULT') as default_count,
-        countIf(level = 'DEBUG') as debug_count,
-        multiIf(
-          arrayExists(x -> x = 'ERROR', groupArray(level)), 'ERROR',
-          arrayExists(x -> x = 'WARNING', groupArray(level)), 'WARNING',
-          arrayExists(x -> x = 'DEFAULT', groupArray(level)), 'DEFAULT',
-          'DEBUG'
-        ) AS aggregated_level,
-        sumMap(cost_details) as cost_details,
-        trace_id,
-        project_id
-      FROM observations o ${skipObservationsDedup ? "" : "FINAL"}
-      WHERE o.project_id = {projectId: String}
-        ${timeStampFilter ? `AND o.start_time >= {traceTimestamp: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}` : ""}
-        ${observationsFilter ? `AND ${observationFilterRes.query}` : ""}
-      GROUP BY trace_id, project_id
-    ),
-         scores_avg AS (
-           SELECT
-             project_id,
-             trace_id,
-             -- For numeric scores, use tuples of (name, avg_value)
-             groupArrayIf(
-               tuple(name, avg_value),
-               data_type IN ('NUMERIC', 'BOOLEAN')
-             ) AS scores_avg,
-             -- For categorical scores, use name:value format for improved query performance
-             groupArrayIf(
-               concat(name, ':', string_value),
-               data_type = 'CATEGORICAL' AND notEmpty(string_value)
-             ) AS score_categories
-           FROM (
-                  SELECT
-                    project_id,
-                    trace_id,
-                    name,
-                    data_type,
-                    string_value,
-                    avg(value) as avg_value
-                  FROM scores s FINAL
-                  WHERE
-                    project_id = {projectId: String}
-                    ${timeStampFilter ? `AND s.timestamp >= {traceTimestamp: DateTime64(3)} - ${SCORE_TO_TRACE_OBSERVATIONS_INTERVAL}` : ""}
-                    ${scoresFilterRes ? `AND ${scoresFilterRes.query}` : ""}
-                  GROUP BY
-                    project_id,
-                    trace_id,
-                    name,
-                    data_type,
-                    string_value
-                ) tmp
-           GROUP BY project_id, trace_id
-         )
-  `;
+  const traceIds = traces.map((t) => t.id);
+  const observations = traceIds.length
+    ? await prisma.$queryRaw<
+        Array<{
+          trace_id: string;
+          level: ObservationLevelType;
+          usage_details: Record<string, unknown> | null;
+          cost_details: Record<string, unknown> | null;
+          total_cost: number | null;
+          start_time: Date;
+          end_time: Date | null;
+        }>
+      >(Prisma.sql`
+        SELECT trace_id, level::text AS level, usage_details, cost_details, total_cost, start_time, end_time
+        FROM observations
+        WHERE project_id = ${projectId}
+          AND trace_id IN (${Prisma.join(traceIds)})
+      `)
+    : [];
+  const scores = traceIds.length
+    ? await prisma.$queryRaw<
+        Array<{ trace_id: string; name: string; value: number | null }>
+      >(Prisma.sql`
+        SELECT trace_id, name, value
+        FROM scores
+        WHERE project_id = ${projectId}
+          AND trace_id IN (${Prisma.join(traceIds)})
+      `)
+    : [];
 
-  return measureAndReturn({
-    operationName: "getTracesTableGeneric",
-    projectId: props.projectId,
-    input: props,
-    fn: async (props) => {
-      let sqlSelect: string;
-      switch (select) {
-        case "count":
-          // Using uniqExact here as we need the correct count to handle pagination right
-          sqlSelect = "uniqExact(t.id) as count";
-          break;
-        case "metrics":
-          sqlSelect = `
-            t.id as id,
-            t.project_id as project_id,
-            t.timestamp as timestamp,
-            o.latency_milliseconds / 1000 as latency,
-            o.cost_details as cost_details,
-            o.usage_details as usage_details,
-            o.aggregated_level as level,
-            o.error_count as error_count,
-            o.warning_count as warning_count,
-            o.default_count as default_count,
-            o.debug_count as debug_count,
-            o.observation_count as observation_count,
-            s.scores_avg as scores_avg,
-            s.score_categories as score_categories,
-            t.public as public`;
-          break;
-        case "rows":
-          sqlSelect = `
-            t.id as id,
-            t.project_id as project_id,
-            t.timestamp as timestamp,
-            t.tags as tags,
-            t.bookmarked as bookmarked,
-            t.name as name,
-            t.release as release,
-            t.version as version,
-            t.user_id as user_id,
-            t.environment as environment,
-            t.session_id as session_id,
-            t.public as public`;
-          break;
-        case "identifiers":
-          sqlSelect = `
-            t.id as id,
-            t.project_id as projectId,
-            t.timestamp as timestamp`;
-          break;
-        default:
-          throw new Error(`Unknown select type: ${select}`);
-      }
+  const byTraceObs = new Map<string, typeof observations>();
+  for (const o of observations) {
+    const key = o.trace_id ?? "";
+    byTraceObs.set(key, [...(byTraceObs.get(key) ?? []), o]);
+  }
+  const byTraceScores = new Map<string, typeof scores>();
+  for (const s of scores) {
+    const key = s.trace_id ?? "";
+    byTraceScores.set(key, [...(byTraceScores.get(key) ?? []), s]);
+  }
 
-      const search = clickhouseSearchCondition(searchQuery, searchType, "t");
-
-      const defaultOrder = orderBy?.order && orderBy?.column === "timestamp";
-      const orderByCols = [
-        ...tracesTableUiColumnDefinitions,
-        {
-          clickhouseSelect: "toDate(t.timestamp)",
-          uiTableName: "timestamp_to_date",
-          uiTableId: "timestamp_to_date",
-          clickhouseTableName: "traces",
+  return traces.map((t) => {
+    const obs = byTraceObs.get(t.id) ?? [];
+    const scoreRows = byTraceScores.get(t.id) ?? [];
+    const level: ObservationLevelType = obs.some((o) => o.level === "ERROR")
+      ? "ERROR"
+      : obs.some((o) => o.level === "WARNING")
+        ? "WARNING"
+        : obs.some((o) => o.level === "DEFAULT")
+          ? "DEFAULT"
+          : "DEBUG";
+    return {
+      id: t.id,
+      project_id: t.project_id,
+      timestamp: t.timestamp,
+      level,
+      observation_count: obs.length,
+      latency:
+        obs.length > 0
+          ? String(
+              Math.max(
+                0,
+                ...obs.map(
+                  (o) =>
+                    (o.end_time ?? o.start_time).getTime() -
+                    o.start_time.getTime(),
+                ),
+              ),
+            )
+          : "0",
+      usage_details: obs.reduce<Record<string, number>>(
+        (acc, o) => {
+          const usage = (o.usage_details ?? {}) as Record<string, unknown>;
+          for (const [k, v] of Object.entries(usage)) {
+            const n = Number(v ?? 0);
+            if (Number.isFinite(n)) acc[k] = (acc[k] ?? 0) + n;
+          }
+          return acc;
         },
-        {
-          clickhouseSelect: "t.event_ts",
-          uiTableName: "event_ts",
-          uiTableId: "event_ts",
-          clickhouseTableName: "traces",
+        { input: 0, output: 0, total: 0 },
+      ),
+      cost_details: obs.reduce<Record<string, number>>(
+        (acc, o) => {
+          const cost = (o.cost_details ?? {}) as Record<string, unknown>;
+          const totalCost = Number(o.total_cost ?? NaN);
+          const detailTotal = Number(cost.total ?? NaN);
+          const resolvedTotal = Number.isFinite(totalCost)
+            ? totalCost
+            : Number.isFinite(detailTotal)
+              ? detailTotal
+              : 0;
+          acc.total += resolvedTotal;
+
+          for (const [k, v] of Object.entries(cost)) {
+            if (k === "total") continue;
+            const n = Number(v ?? 0);
+            if (Number.isFinite(n)) acc[k] = (acc[k] ?? 0) + n;
+          }
+          return acc;
         },
-      ];
-      const chOrderBy = orderByToClickhouseSql(
-        [
-          defaultOrder
-            ? [
-                {
-                  column: "timestamp_to_date",
-                  order: orderBy.order,
-                },
-                { column: "timestamp", order: orderBy.order },
-                { column: "event_ts", order: "DESC" as "DESC" },
-              ]
-            : null,
-          orderBy ?? null,
-        ].flat(),
-        orderByCols,
-      );
-
-      // complex query ahead:
-      // - we only join scores and observations if we really need them to speed up default views
-      // - we use FINAL on traces only in case we not need to order by something different than time. Otherwise we cannot guarantee correct reads.
-      // - we filter the observations and scores as much as possible before joining them to traces.
-      // - we order by todate(timestamp), event_ts desc per default and do not use FINAL.
-      //   In this case, CH is able to read the data only from the latest date from disk and filtering them in memory. No need to read all data e.g. for 1 month from disk.
-
-      const query = `
-        ${observationsAndScoresCTE}
-
-        SELECT ${sqlSelect}
-        -- FINAL is used for non default ordering.
-        FROM traces t  ${defaultOrder || select === "count" ? "" : "FINAL"}
-        ${select === "metrics" || requiresObservationsJoin ? `LEFT JOIN observations_stats o on o.project_id = t.project_id and o.trace_id = t.id` : ""}
-        ${select === "metrics" || requiresScoresJoin ? `LEFT JOIN scores_avg s on s.project_id = t.project_id and s.trace_id = t.id` : ""}
-        WHERE t.project_id = {projectId: String}
-        ${tracesFilterRes ? `AND ${tracesFilterRes.query}` : ""}
-        ${search.query}
-        ${chOrderBy}
-        -- This is used for metrics and row queries. Count has only one result.
-        -- This is only used for default ordering. Otherwise, we use final.
-        ${["metrics", "rows", "identifiers"].includes(select) && defaultOrder ? "LIMIT 1 BY id, project_id" : ""}
-        ${limit !== undefined && page !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
-      `;
-
-      const res = await queryClickhouse<
-        SelectReturnTypeMap[keyof SelectReturnTypeMap]
-      >({
-        query: query,
-        params: {
-          limit: limit,
-          offset: limit && page ? limit * page : 0,
-          traceTimestamp: timeStampFilter?.value.getTime(),
-          projectId: projectId,
-          ...tracesFilterRes.params,
-          ...observationFilterRes.params,
-          ...scoresFilterRes.params,
-          ...search.params,
-        },
-        tags: {
-          ...(props.tags ?? {}),
-          feature: "tracing",
-          type: "traces-table",
-          projectId,
-          operation_name: "getTracesTableGeneric",
-        },
-        clickhouseConfigs,
-      });
-
-      return res;
-    },
+        { input: 0, output: 0, total: 0 },
+      ),
+      scores_avg: Object.values(
+        scoreRows.reduce<
+          Record<string, { name: string; sum: number; count: number }>
+        >((acc, s) => {
+          const key = s.name;
+          const next = acc[key] ?? { name: s.name, sum: 0, count: 0 };
+          next.sum += Number(s.value ?? 0);
+          next.count += 1;
+          acc[key] = next;
+          return acc;
+        }, {}),
+      ).map((s) => ({
+        name: s.name,
+        avg_value: s.count > 0 ? s.sum / s.count : 0,
+      })),
+      error_count: obs.filter((o) => o.level === "ERROR").length,
+      warning_count: obs.filter((o) => o.level === "WARNING").length,
+      default_count: obs.filter((o) => o.level === "DEFAULT").length,
+      debug_count: obs.filter((o) => o.level === "DEBUG").length,
+    };
   });
 }
 

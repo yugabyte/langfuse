@@ -1,9 +1,5 @@
-import { transformDbDatasetRunItemToAPIDatasetRunItemCh } from "@/src/features/public-api/types/datasets";
+import { prisma } from "@langfuse/shared/src/db";
 import { isPresent } from "@langfuse/shared";
-import {
-  getDatasetRunItemsByDatasetIdCh,
-  getDatasetRunItemsCountByDatasetIdCh,
-} from "@langfuse/shared/src/server";
 
 type DatasetRunItemsQueryType = {
   datasetId: string;
@@ -19,30 +15,54 @@ export const generateDatasetRunItemsForPublicApi = async ({
   props: DatasetRunItemsQueryType;
 }) => {
   const { datasetId, projectId, runId, limit, page } = props;
-
-  const result = await getDatasetRunItemsByDatasetIdCh({
-    projectId,
-    datasetId,
-    filter: [
-      {
-        column: "datasetRunId",
-        operator: "any of",
-        value: [runId],
-        type: "stringOptions" as const,
-      },
-    ],
-    orderBy: {
-      column: "createdAt",
-      order: "DESC",
+  const datasetItems = await prisma.datasetItem.findMany({
+    where: {
+      projectId,
+      datasetId,
     },
-    limit: limit,
-    offset:
+    select: {
+      id: true,
+    },
+  });
+  const datasetItemIds = datasetItems.map((item) => item.id);
+  if (datasetItemIds.length === 0) return [];
+
+  const items = await prisma.datasetRunItems.findMany({
+    where: {
+      projectId,
+      datasetItemId: {
+        in: datasetItemIds,
+      },
+      datasetRunId: runId,
+    },
+    include: {
+      datasetRun: {
+        select: {
+          name: true,
+        },
+      },
+    },
+    orderBy: {
+      createdAt: "desc",
+    },
+    take: limit,
+    skip:
       isPresent(page) && isPresent(limit) && page >= 1
         ? (page - 1) * limit
         : undefined,
   });
 
-  return result.map(transformDbDatasetRunItemToAPIDatasetRunItemCh);
+  const mappedItems = items.map((item) => ({
+    id: item.id,
+    datasetRunId: item.datasetRunId,
+    datasetRunName: item.datasetRun.name,
+    datasetItemId: item.datasetItemId,
+    traceId: item.traceId,
+    observationId: item.observationId ?? null,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  }));
+  return mappedItems;
 };
 
 export const getDatasetRunItemsCountForPublicApi = async ({
@@ -51,17 +71,26 @@ export const getDatasetRunItemsCountForPublicApi = async ({
   props: DatasetRunItemsQueryType;
 }) => {
   const { datasetId, projectId, runId } = props;
-
-  return await getDatasetRunItemsCountByDatasetIdCh({
-    projectId,
-    datasetId,
-    filter: [
-      {
-        column: "datasetRunId",
-        operator: "any of",
-        value: [runId],
-        type: "stringOptions" as const,
-      },
-    ],
+  const datasetItems = await prisma.datasetItem.findMany({
+    where: {
+      projectId,
+      datasetId,
+    },
+    select: {
+      id: true,
+    },
   });
+  const datasetItemIds = datasetItems.map((item) => item.id);
+  if (datasetItemIds.length === 0) return 0;
+
+  const count = await prisma.datasetRunItems.count({
+    where: {
+      projectId,
+      datasetItemId: {
+        in: datasetItemIds,
+      },
+      datasetRunId: runId,
+    },
+  });
+  return count;
 };

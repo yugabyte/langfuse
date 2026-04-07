@@ -257,12 +257,12 @@ export const handleBatchExportJob = async (
 
   const storageService = StorageServiceFactory.getInstance(storageParams);
 
-  await storageService.uploadFileBuffered({
+  await storageService.uploadFile({
     fileName,
     fileType:
       exportOptions[jobDetails.format as BatchExportFileFormat].fileType,
     data: fileStream,
-    partSizeBytes: env.BATCH_EXPORT_S3_PART_SIZE_MIB * 1024 * 1024,
+    partSize: env.BATCH_EXPORT_S3_PART_SIZE_MIB * 1024 * 1024,
   });
 
   const signedUrl = await storageService.getSignedUrl(

@@ -1,0 +1,26 @@
+# Build + start all services
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml up -d --build
+
+# Build + start tracing stack (isolated Postgres + schema init + app)
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml up -d --build postgres-tracing postgres-tracing-schema-init langfuse-worker langfuse-web
+
+# Follow web + worker logs
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml logs -f --tail=200 langfuse-web langfuse-worker
+
+# Follow isolated tracing Postgres logs
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml logs -f --tail=200 postgres-tracing
+
+# Show running services
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml ps
+
+# Open psql shell (isolated tracing Postgres)
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml exec -it postgres-tracing psql -U postgres -d postgres
+
+# One-shot tracing row counts (isolated tracing Postgres)
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml exec -T postgres-tracing psql -U postgres -d postgres -c "SELECT COUNT(*) AS traces FROM traces; SELECT COUNT(*) AS observations FROM observations; SELECT COUNT(*) AS scores FROM scores;"
+
+# Verify web is connected to isolated tracing Postgres
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml exec -T langfuse-web env | grep DATABASE_URL
+
+# Stop services
+docker compose -f docker-compose.dev.yml -f docker-compose.local-build.yml down

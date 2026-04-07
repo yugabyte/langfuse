@@ -1,43 +1,17 @@
-import {
-  commandClickhouse,
-  parseClickhouseUTCDateTimeFormat,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
+import { parseClickhouseUTCDateTimeFormat } from "./clickhouse";
 import { logger } from "../logger";
 import { InternalServerError, LangfuseNotFoundError } from "../../errors";
-import { prisma } from "../../db";
+import { tracingPrisma as prisma } from "../../db";
 import { ObservationRecordReadType } from "./definitions";
 import { FilterState } from "../../types";
-import {
-  DateTimeFilter,
-  FilterList,
-  StringFilter,
-  FullObservations,
-  orderByToClickhouseSql,
-} from "../queries";
-import { createFilterFromFilterState } from "../queries/clickhouse-sql/factory";
-import {
-  observationsTableTraceUiColumnDefinitions,
-  observationsTableUiColumnDefinitions,
-} from "../tableMappings";
+import { FullObservations } from "../queries";
 import { OrderByState } from "../../interfaces/orderBy";
 import { getTracesByIds } from "./traces";
-import { measureAndReturn } from "../clickhouse/measureAndReturn";
-import {
-  convertDateToClickhouseDateTime,
-  PreferredClickhouseService,
-} from "../clickhouse/client";
+import { PreferredClickhouseService } from "../clickhouse/client";
 import {
   convertObservation,
   enrichObservationWithModelData,
 } from "./observations_converters";
-import { clickhouseSearchCondition } from "../queries/clickhouse-sql/search";
-import {
-  OBSERVATIONS_TO_TRACE_INTERVAL,
-  TRACE_TO_OBSERVATIONS_INTERVAL,
-} from "./constants";
 import { env } from "../../env";
 import { TracingSearchType } from "../../interfaces/search";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
@@ -45,7 +19,160 @@ import type { AnalyticsGenerationEvent } from "../analytics-integrations/types";
 import { ObservationType } from "../../domain";
 import { recordDistribution } from "../instrumentation";
 import { DEFAULT_RENDERING_PROPS, RenderingProps } from "../utils/rendering";
-import { shouldSkipObservationsFinal } from "../queries/clickhouse-sql/query-options";
+import { Prisma } from "@prisma/client";
+
+const toClickhouseDateTimeString = (value: Date | null | undefined) =>
+  value ? value.toISOString().replace("T", " ").replace("Z", "") : undefined;
+
+const toClickhouseMetadataRecord = (value: unknown): Record<string, string> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+      k,
+      typeof v === "string" ? v : JSON.stringify(v),
+    ]),
+  );
+};
+
+const toJsonValue = (value: unknown) => {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+};
+
+const toJsonString = (value: unknown) => JSON.stringify(value ?? {});
+const toJsonArrayString = (value: unknown) => JSON.stringify(value ?? []);
+
+const parseDateInput = (value: unknown) => {
+  if (value instanceof Date) return value;
+  if (typeof value === "number") return new Date(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return new Date(Number(value));
+  }
+  return parseClickhouseUTCDateTimeFormat(String(value));
+};
+
+const OBSERVATION_TYPE_VALUES = new Set([
+  "SPAN",
+  "GENERATION",
+  "EVENT",
+  "AGENT",
+  "TOOL",
+  "CHAIN",
+  "RETRIEVER",
+  "EVALUATOR",
+  "EMBEDDING",
+  "GUARDRAIL",
+] as const);
+
+const OBSERVATION_LEVEL_VALUES = new Set([
+  "DEBUG",
+  "DEFAULT",
+  "WARNING",
+  "ERROR",
+] as const);
+
+const toObservationTypeEnum = (value: unknown) => {
+  const normalized = String(value ?? "SPAN").toUpperCase();
+  return OBSERVATION_TYPE_VALUES.has(normalized as any) ? normalized : "SPAN";
+};
+
+const toObservationLevelEnum = (value: unknown) => {
+  const normalized = String(value ?? "DEFAULT").toUpperCase();
+  return OBSERVATION_LEVEL_VALUES.has(normalized as any)
+    ? normalized
+    : "DEFAULT";
+};
+
+type PgObservationRow = {
+  id: string;
+  trace_id: string | null;
+  project_id: string;
+  type: string;
+  parent_observation_id: string | null;
+  environment: string | null;
+  start_time: Date;
+  end_time: Date | null;
+  name: string | null;
+  metadata: Record<string, unknown> | null;
+  level: string | null;
+  status_message: string | null;
+  version: string | null;
+  input: string | null;
+  output: string | null;
+  provided_model_name: string | null;
+  internal_model_id: string | null;
+  model_parameters: Record<string, unknown> | null;
+  provided_usage_details: Record<string, number> | null;
+  usage_details: Record<string, number> | null;
+  provided_cost_details: Record<string, number> | null;
+  cost_details: Record<string, number> | null;
+  total_cost: number | null;
+  usage_pricing_tier_id: string | null;
+  usage_pricing_tier_name: string | null;
+  completion_start_time: Date | null;
+  prompt_id: string | null;
+  prompt_name: string | null;
+  prompt_version: number | null;
+  tool_definitions: Record<string, string> | null;
+  tool_calls: string[] | null;
+  tool_call_names: string[] | null;
+  created_at: Date;
+  updated_at: Date;
+  event_ts: Date;
+  is_deleted: boolean;
+};
+
+const toObservationRecordReadType = (
+  record: PgObservationRow,
+  includeIO: boolean,
+): ObservationRecordReadType => {
+  return {
+    id: record.id,
+    trace_id: record.trace_id,
+    project_id: record.project_id,
+    type: record.type,
+    parent_observation_id: record.parent_observation_id,
+    environment: record.environment ?? "default",
+    name: record.name,
+    metadata: includeIO ? toClickhouseMetadataRecord(record.metadata) : {},
+    level: record.level,
+    status_message: record.status_message,
+    version: record.version,
+    input: includeIO ? record.input : null,
+    output: includeIO ? record.output : null,
+    provided_model_name: record.provided_model_name,
+    internal_model_id: record.internal_model_id,
+    model_parameters: record.model_parameters
+      ? JSON.stringify(record.model_parameters)
+      : null,
+    total_cost: record.total_cost ?? null,
+    usage_pricing_tier_id: record.usage_pricing_tier_id,
+    usage_pricing_tier_name: record.usage_pricing_tier_name,
+    prompt_id: record.prompt_id,
+    prompt_name: record.prompt_name,
+    prompt_version: record.prompt_version,
+    tool_definitions: record.tool_definitions ?? {},
+    tool_calls: record.tool_calls ?? [],
+    tool_call_names: record.tool_call_names ?? [],
+    is_deleted: record.is_deleted ? 1 : 0,
+    created_at: toClickhouseDateTimeString(record.created_at) ?? "",
+    updated_at: toClickhouseDateTimeString(record.updated_at) ?? "",
+    start_time: toClickhouseDateTimeString(record.start_time) ?? "",
+    end_time: toClickhouseDateTimeString(record.end_time) ?? null,
+    completion_start_time:
+      toClickhouseDateTimeString(record.completion_start_time) ?? null,
+    event_ts: toClickhouseDateTimeString(record.event_ts) ?? "",
+    provided_usage_details: record.provided_usage_details ?? {},
+    provided_cost_details: record.provided_cost_details ?? {},
+    usage_details: record.usage_details ?? {},
+    cost_details: record.cost_details ?? {},
+  };
+};
 
 /**
  * Checks if observation exists in clickhouse.
@@ -64,33 +191,14 @@ export const checkObservationExists = async (
   id: string,
   startTime: Date | undefined,
 ): Promise<boolean> => {
-  const query = `
-    SELECT id, project_id
-    FROM observations o
-    WHERE project_id = {projectId: String}
-    AND id = {id: String}
-    ${startTime ? `AND start_time >= {startTime: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}` : ""}
-    ORDER BY event_ts DESC
-    LIMIT 1 BY id, project_id
-  `;
-
-  const rows = await queryClickhouse<{ id: string; project_id: string }>({
-    query,
-    params: {
-      id,
-      projectId,
-      ...(startTime
-        ? { startTime: convertDateToClickhouseDateTime(startTime) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "exists",
-      projectId,
-    },
-  });
-
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT id
+    FROM observations
+    WHERE id = ${id}
+      AND project_id = ${projectId}
+      ${startTime ? Prisma.sql`AND start_time >= ${new Date(startTime.getTime() - 2 * 24 * 60 * 60 * 1000)}` : Prisma.empty}
+    LIMIT 1
+  `);
   return rows.length > 0;
 };
 
@@ -110,17 +218,73 @@ export const upsertObservation = async (
       "Identifier fields must be provided to upsert Observation.",
     );
   }
-  await upsertClickhouse({
-    table: "observations",
-    records: [observation as ObservationRecordReadType],
-    eventBodyMapper: convertObservation,
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "upsert",
-      projectId: observation.project_id ?? "",
-    },
-  });
+  const startTime = parseDateInput(observation.start_time);
+
+  const createdAt = observation.created_at
+    ? parseDateInput(observation.created_at)
+    : startTime;
+  const updatedAt = observation.updated_at
+    ? parseDateInput(observation.updated_at)
+    : startTime;
+  const observationType = toObservationTypeEnum(observation.type);
+  const observationLevel = toObservationLevelEnum(observation.level);
+  await prisma.$executeRaw`
+    DELETE FROM observations
+    WHERE project_id = ${observation.project_id as string}
+      AND id = ${observation.id as string}
+  `;
+  await prisma.$executeRaw`
+    INSERT INTO observations (
+      id, project_id, trace_id, parent_observation_id, environment, type, name,
+      start_time, end_time, level, status_message, version, input, output, metadata,
+      provided_model_name, internal_model_id, model_parameters,
+      provided_usage_details, usage_details, provided_cost_details, cost_details,
+      total_cost, usage_pricing_tier_id, usage_pricing_tier_name, completion_start_time,
+      prompt_id, prompt_name, prompt_version, tool_definitions, tool_calls, tool_call_names,
+      created_at, updated_at, event_ts, is_deleted
+    ) VALUES (
+      ${observation.id as string},
+      ${observation.project_id as string},
+      ${observation.trace_id ?? (observation.id as string)},
+      ${observation.parent_observation_id ?? null},
+      ${observation.environment ?? "default"},
+      ${observationType}::observation_type,
+      ${observation.name ?? ""},
+      ${startTime},
+      ${observation.end_time ? parseDateInput(observation.end_time) : null},
+      ${observationLevel}::observation_level,
+      ${observation.status_message ?? null},
+      ${observation.version ?? null},
+      ${typeof observation.input === "string" ? observation.input : observation.input == null ? null : JSON.stringify(observation.input)},
+      ${typeof observation.output === "string" ? observation.output : observation.output == null ? null : JSON.stringify(observation.output)},
+      ${toJsonString(observation.metadata)}::jsonb,
+      ${observation.provided_model_name ?? null},
+      ${observation.internal_model_id ?? null},
+      ${
+        toJsonValue(observation.model_parameters) == null
+          ? null
+          : JSON.stringify(toJsonValue(observation.model_parameters))
+      }::jsonb,
+      ${toJsonString(observation.provided_usage_details)}::jsonb,
+      ${toJsonString(observation.usage_details)}::jsonb,
+      ${toJsonString(observation.provided_cost_details)}::jsonb,
+      ${toJsonString(observation.cost_details)}::jsonb,
+      ${observation.total_cost ?? null},
+      ${observation.usage_pricing_tier_id ?? null},
+      ${observation.usage_pricing_tier_name ?? null},
+      ${observation.completion_start_time ? parseDateInput(observation.completion_start_time) : null},
+      ${observation.prompt_id ?? null},
+      ${observation.prompt_name ?? null},
+      ${observation.prompt_version ?? null},
+      ${toJsonString(observation.tool_definitions)}::jsonb,
+      ${toJsonArrayString(observation.tool_calls)}::jsonb,
+      ${observation.tool_call_names ?? []},
+      ${createdAt},
+      ${updatedAt},
+      ${updatedAt},
+      ${false}
+    )
+  `;
 };
 
 export type GetObservationsForTraceOpts<IncludeIO extends boolean> = {
@@ -139,70 +303,20 @@ export const getObservationsForTrace = async <IncludeIO extends boolean>(
     projectId,
     timestamp,
     includeIO = false,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   } = opts;
 
-  // OTel projects use immutable spans - no need for deduplication
-  const skipDedup = await shouldSkipObservationsFinal(projectId);
-
-  const query = `
-  SELECT
-    id,
-    trace_id,
-    project_id,
-    type,
-    parent_observation_id,
-    environment,
-    start_time,
-    end_time,
-    name,
-    level,
-    status_message,
-    version,
-    ${includeIO === true ? "input, output, metadata," : ""}
-    provided_model_name,
-    internal_model_id,
-    model_parameters,
-    provided_usage_details,
-    usage_details,
-    provided_cost_details,
-    cost_details,
-    total_cost,
-    usage_pricing_tier_id,
-    usage_pricing_tier_name,
-    completion_start_time,
-    prompt_id,
-    prompt_name,
-    prompt_version,
-    tool_definitions,
-    tool_calls,
-    tool_call_names,
-    created_at,
-    updated_at,
-    event_ts
-  FROM observations
-  WHERE trace_id = {traceId: String}
-  AND project_id = {projectId: String}
-   ${timestamp ? `AND start_time >= {traceTimestamp: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-  ${skipDedup ? "" : "ORDER BY event_ts DESC"}
-  ${skipDedup ? "" : "LIMIT 1 BY id, project_id"}`;
-  const records = await queryClickhouse<ObservationRecordReadType>({
-    query,
-    params: {
-      traceId,
-      projectId,
-      ...(timestamp
-        ? { traceTimestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "list",
-      projectId,
-    },
-    preferredClickhouseService,
-  });
+  const recordsRaw = await prisma.$queryRaw<PgObservationRow[]>(Prisma.sql`
+    SELECT *
+    FROM observations
+    WHERE trace_id = ${traceId}
+      AND project_id = ${projectId}
+      ${timestamp ? Prisma.sql`AND start_time >= ${new Date(timestamp.getTime() - 2 * 24 * 60 * 60 * 1000)}` : Prisma.empty}
+    ORDER BY updated_at DESC
+  `);
+  const records = recordsRaw.map((r) =>
+    toObservationRecordReadType(r, includeIO === true),
+  );
 
   // Large number of observations in trace with large input / output / metadata will lead to
   // high CPU and memory consumption in the convertObservation step, where parsing occurs
@@ -264,67 +378,22 @@ export const getObservationForTraceIdByName = async ({
   timestamp?: Date;
   fetchWithInputOutput?: boolean;
 }) => {
-  const query = `
-  SELECT
-    id,
-    trace_id,
-    project_id,
-    type,
-    parent_observation_id,
-    environment,
-    start_time,
-    end_time,
-    name,
-    metadata,
-    level,
-    status_message,
-    version,
-    ${fetchWithInputOutput ? "input, output," : ""}
-    provided_model_name,
-    internal_model_id,
-    model_parameters,
-    provided_usage_details,
-    usage_details,
-    provided_cost_details,
-    cost_details,
-    total_cost,
-    usage_pricing_tier_id,
-    usage_pricing_tier_name,
-    completion_start_time,
-    prompt_id,
-    prompt_name,
-    prompt_version,
-    tool_definitions,
-    tool_calls,
-    tool_call_names,
-    created_at,
-    updated_at,
-    event_ts
-  FROM observations
-  WHERE trace_id = {traceId: String}
-  AND project_id = {projectId: String}
-  AND name = {name: String}
-   ${timestamp ? `AND start_time >= {traceTimestamp: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
-  ORDER BY event_ts DESC
-  LIMIT 1 BY id, project_id`;
-  const records = await queryClickhouse<ObservationRecordReadType>({
-    query,
-    params: {
-      traceId,
-      projectId,
-      name,
-      ...(timestamp
-        ? { traceTimestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "list",
-      projectId,
-    },
-  });
-
+  const rows = await prisma.$queryRaw<PgObservationRow[]>(Prisma.sql`
+    SELECT DISTINCT ON (id, project_id) *
+    FROM observations
+    WHERE trace_id = ${traceId}
+      AND project_id = ${projectId}
+      AND name = ${name}
+      ${
+        timestamp
+          ? Prisma.sql`AND start_time >= ${new Date(timestamp.getTime() - 2 * 24 * 60 * 60 * 1000)}`
+          : Prisma.empty
+      }
+    ORDER BY id, project_id, event_ts DESC
+  `);
+  const records = rows.map((row) =>
+    toObservationRecordReadType(row, fetchWithInputOutput),
+  );
   return records.map((record) => convertObservation(record));
 };
 
@@ -336,7 +405,7 @@ export const getObservationById = async ({
   type,
   traceId,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  preferredClickhouseService,
+  preferredClickhouseService: _preferredClickhouseService,
 }: {
   id: string;
   projectId: string;
@@ -355,7 +424,7 @@ export const getObservationById = async ({
     type,
     traceId,
     renderingProps,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   });
   const mapped = records.map((record) =>
     convertObservation(record, renderingProps),
@@ -390,50 +459,16 @@ export const getObservationsById = async (
   projectId: string,
   fetchWithInputOutput: boolean = false,
 ) => {
-  const query = `
-  SELECT
-    id,
-    trace_id,
-    project_id,
-    type,
-    parent_observation_id,
-    start_time,
-    end_time,
-    name,
-    metadata,
-    level,
-    status_message,
-    version,
-    ${fetchWithInputOutput ? "input, output," : ""}
-    provided_model_name,
-    internal_model_id,
-    model_parameters,
-    provided_usage_details,
-    usage_details,
-    provided_cost_details,
-    cost_details,
-    total_cost,
-    usage_pricing_tier_id,
-    usage_pricing_tier_name,
-    completion_start_time,
-    prompt_id,
-    prompt_name,
-    prompt_version,
-    tool_definitions,
-    tool_calls,
-    tool_call_names,
-    created_at,
-    updated_at,
-    event_ts
-  FROM observations
-  WHERE id IN ({ids: Array(String)})
-  AND project_id = {projectId: String}
-  ORDER BY event_ts desc
-  LIMIT 1 by id, project_id`;
-  const records = await queryClickhouse<ObservationRecordReadType>({
-    query,
-    params: { ids, projectId },
-  });
+  const recordsRaw = await prisma.$queryRaw<PgObservationRow[]>(Prisma.sql`
+    SELECT *
+    FROM observations
+    WHERE id IN (${Prisma.join(ids)})
+      AND project_id = ${projectId}
+    ORDER BY updated_at DESC
+  `);
+  const records = recordsRaw.map((record) =>
+    toObservationRecordReadType(record, fetchWithInputOutput),
+  );
   return records.map((record) => convertObservation(record));
 };
 
@@ -445,7 +480,7 @@ const getObservationByIdInternal = async ({
   type,
   traceId,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  preferredClickhouseService,
+  preferredClickhouseService: _preferredClickhouseService,
 }: {
   id: string;
   projectId: string;
@@ -456,68 +491,71 @@ const getObservationByIdInternal = async ({
   renderingProps?: RenderingProps;
   preferredClickhouseService?: PreferredClickhouseService;
 }) => {
-  const query = `
-  SELECT
-    id,
-    trace_id,
-    project_id,
-    environment,
-    type,
-    parent_observation_id,
-    start_time,
-    end_time,
-    name,
-    metadata,
-    level,
-    status_message,
-    version,
-    ${fetchWithInputOutput ? (renderingProps.truncated ? `leftUTF8(input, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT}) as input, leftUTF8(output, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT}) as output,` : "input, output,") : ""}
-    provided_model_name,
-    internal_model_id,
-    model_parameters,
-    provided_usage_details,
-    usage_details,
-    provided_cost_details,
-    cost_details,
-    total_cost,
-    usage_pricing_tier_id,
-    usage_pricing_tier_name,
-    completion_start_time,
-    prompt_id,
-    prompt_name,
-    prompt_version,
-    tool_definitions,
-    tool_calls,
-    tool_call_names,
-    created_at,
-    updated_at,
-    event_ts
-  FROM observations
-  WHERE id = {id: String}
-  AND project_id = {projectId: String}
-  ${startTime ? `AND toDate(start_time) = toDate({startTime: DateTime64(3)})` : ""}
-  ${type ? `AND type = {type: String}` : ""}
-  ${traceId ? `AND trace_id = {traceId: String}` : ""}
-  ORDER BY event_ts desc
-  LIMIT 1 by id, project_id`;
-  return await queryClickhouse<ObservationRecordReadType>({
-    query,
-    params: {
-      id,
-      projectId,
-      ...(startTime
-        ? { startTime: convertDateToClickhouseDateTime(startTime) }
-        : {}),
-      ...(traceId ? { traceId } : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "byId",
-      projectId,
-    },
-    preferredClickhouseService,
-  });
+  const startTimeWhere: { gte?: Date; lt?: Date } = {};
+  if (startTime) {
+    startTimeWhere.gte = new Date(
+      Date.UTC(
+        startTime.getUTCFullYear(),
+        startTime.getUTCMonth(),
+        startTime.getUTCDate(),
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+    startTimeWhere.lt = new Date(
+      Date.UTC(
+        startTime.getUTCFullYear(),
+        startTime.getUTCMonth(),
+        startTime.getUTCDate() + 1,
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+  }
+
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`id = ${id}`,
+    Prisma.sql`project_id = ${projectId}`,
+  ];
+  if (type) conditions.push(Prisma.sql`type::text = ${type}`);
+  if (traceId) conditions.push(Prisma.sql`trace_id = ${traceId}`);
+  if (startTimeWhere.gte)
+    conditions.push(Prisma.sql`start_time >= ${startTimeWhere.gte}`);
+  if (startTimeWhere.lt)
+    conditions.push(Prisma.sql`start_time < ${startTimeWhere.lt}`);
+  const rows = await prisma.$queryRaw<PgObservationRow[]>(Prisma.sql`
+    SELECT *
+    FROM observations
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `);
+  const record = rows[0];
+
+  if (!record) return [];
+
+  const mapped = toObservationRecordReadType(record, fetchWithInputOutput);
+
+  if (fetchWithInputOutput && renderingProps.truncated) {
+    if (typeof mapped.input === "string") {
+      mapped.input = mapped.input.slice(
+        0,
+        env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT,
+      );
+    }
+    if (typeof mapped.output === "string") {
+      mapped.output = mapped.output.slice(
+        0,
+        env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT,
+      );
+    }
+  }
+
+  return [mapped];
 };
 
 export type ObservationTableQuery = {
@@ -631,339 +669,268 @@ const getObservationsTableInternal = async <T>(
     tags: Record<string, string>;
   },
 ): Promise<Array<T>> => {
-  const select =
-    opts.select === "count"
-      ? "count(*) as count"
-      : `
-        o.id as id,
-        o.type as type,
-        o.project_id as "project_id",
-        o.name as name,
-        o."model_parameters" as model_parameters,
-        o.start_time as "start_time",
-        o.end_time as "end_time",
-        o.trace_id as "trace_id",
-        o.completion_start_time as "completion_start_time",
-        o.provided_usage_details as "provided_usage_details",
-        o.usage_details as "usage_details",
-        o.provided_cost_details as "provided_cost_details",
-        o.cost_details as "cost_details",
-        o.level as level,
-        o.environment as "environment",
-        o.status_message as "status_message",
-        o.version as version,
-        o.parent_observation_id as "parent_observation_id",
-        o.created_at as "created_at",
-        o.updated_at as "updated_at",
-        o.provided_model_name as "provided_model_name",
-        o.total_cost as "total_cost",
-        o.usage_pricing_tier_id as "usage_pricing_tier_id",
-        o.usage_pricing_tier_name as "usage_pricing_tier_name",
-        o.prompt_id as "prompt_id",
-        o.prompt_name as "prompt_name",
-        o.prompt_version as "prompt_version",
-        internal_model_id as "internal_model_id",
-        if(isNull(end_time), NULL, date_diff('millisecond', start_time, end_time)) as latency,
-        if(isNull(completion_start_time), NULL,  date_diff('millisecond', start_time, completion_start_time)) as "time_to_first_token",
-        length(mapKeys(o.tool_definitions)) as "tool_definitions_count",
-        length(o.tool_calls) as "tool_calls_count"`;
+  const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, "");
+  const projectId = opts.projectId;
+  const conditions: Prisma.Sql[] = [Prisma.sql`o.project_id = ${projectId}`];
+  let needsTraceJoin = false;
 
-  const {
-    projectId,
-    filter,
-    selectIOAndMetadata,
-    limit,
-    offset,
-    orderBy,
-    clickhouseConfigs,
-  } = opts;
+  const columnExpr = (columnRaw: string): Prisma.Sql | null => {
+    const column = normalize(columnRaw);
+    switch (column) {
+      case "id":
+        return Prisma.sql`o.id`;
+      case "name":
+        return Prisma.sql`o.name`;
+      case "type":
+        return Prisma.sql`o.type::text`;
+      case "level":
+        return Prisma.sql`o.level::text`;
+      case "parentobservationid":
+        return Prisma.sql`o.parent_observation_id`;
+      case "environment":
+        return Prisma.sql`o.environment`;
+      case "statusmessage":
+        return Prisma.sql`o.status_message`;
+      case "version":
+        return Prisma.sql`o.version`;
+      case "model":
+        return Prisma.sql`o.provided_model_name`;
+      case "modelid":
+        return Prisma.sql`o.internal_model_id`;
+      case "promptname":
+        return Prisma.sql`o.prompt_name`;
+      case "promptversion":
+        return Prisma.sql`o.prompt_version`;
+      case "starttime":
+        return Prisma.sql`o.start_time`;
+      case "endtime":
+        return Prisma.sql`o.end_time`;
+      case "totaltokens":
+      case "tokens":
+        return Prisma.sql`COALESCE((o.usage_details->>'total')::numeric, 0)`;
+      case "inputtokens":
+        return Prisma.sql`COALESCE((o.usage_details->>'input')::numeric, 0)`;
+      case "outputtokens":
+        return Prisma.sql`COALESCE((o.usage_details->>'output')::numeric, 0)`;
+      case "totalcost":
+        return Prisma.sql`COALESCE(o.total_cost, 0)`;
+      case "inputcost":
+        return Prisma.sql`COALESCE((o.cost_details->>'input')::numeric, 0)`;
+      case "outputcost":
+        return Prisma.sql`COALESCE((o.cost_details->>'output')::numeric, 0)`;
+      case "latency":
+        return Prisma.sql`COALESCE(EXTRACT(EPOCH FROM (COALESCE(o.end_time, o.start_time) - o.start_time)), 0)`;
+      case "timetofirsttoken":
+        return Prisma.sql`COALESCE(EXTRACT(EPOCH FROM (COALESCE(o.completion_start_time, o.start_time) - o.start_time)), 0)`;
+      case "traceid":
+        return Prisma.sql`o.trace_id`;
+      case "tracename":
+        needsTraceJoin = true;
+        return Prisma.sql`t.name`;
+      case "userid":
+        needsTraceJoin = true;
+        return Prisma.sql`t.user_id`;
+      case "sessionid":
+        needsTraceJoin = true;
+        return Prisma.sql`t.session_id`;
+      case "tracetags":
+        needsTraceJoin = true;
+        return Prisma.sql`t.tags::text`;
+      case "traceenvironment":
+        needsTraceJoin = true;
+        return Prisma.sql`t.environment`;
+      default:
+        return null;
+    }
+  };
 
-  // OTel projects use immutable spans - no need for deduplication
-  const skipDedup = await shouldSkipObservationsFinal(projectId);
+  for (const f of opts.filter) {
+    const expr = columnExpr(f.column);
+    if (!expr) continue;
 
-  const selectString = selectIOAndMetadata
-    ? `${select}, o.input, o.output, o.metadata`
-    : select;
+    if (f.type === "datetime") {
+      if (f.operator === ">=")
+        conditions.push(Prisma.sql`${expr} >= ${f.value}`);
+      if (f.operator === ">") conditions.push(Prisma.sql`${expr} > ${f.value}`);
+      if (f.operator === "<=")
+        conditions.push(Prisma.sql`${expr} <= ${f.value}`);
+      if (f.operator === "<") conditions.push(Prisma.sql`${expr} < ${f.value}`);
+      continue;
+    }
+    if (f.type === "number") {
+      if (f.operator === "=") conditions.push(Prisma.sql`${expr} = ${f.value}`);
+      if (f.operator === ">") conditions.push(Prisma.sql`${expr} > ${f.value}`);
+      if (f.operator === "<") conditions.push(Prisma.sql`${expr} < ${f.value}`);
+      if (f.operator === ">=")
+        conditions.push(Prisma.sql`${expr} >= ${f.value}`);
+      if (f.operator === "<=")
+        conditions.push(Prisma.sql`${expr} <= ${f.value}`);
+      continue;
+    }
+    if (f.type === "string") {
+      if (f.operator === "=") conditions.push(Prisma.sql`${expr} = ${f.value}`);
+      if (f.operator === "contains")
+        conditions.push(Prisma.sql`${expr} ILIKE ${`%${f.value}%`}`);
+      if (f.operator === "does not contain")
+        conditions.push(Prisma.sql`${expr} NOT ILIKE ${`%${f.value}%`}`);
+      if (f.operator === "starts with")
+        conditions.push(Prisma.sql`${expr} ILIKE ${`${f.value}%`}`);
+      if (f.operator === "ends with")
+        conditions.push(Prisma.sql`${expr} ILIKE ${`%${f.value}`}`);
+      continue;
+    }
+    if (f.type === "stringOptions") {
+      if (f.operator === "any of") {
+        conditions.push(Prisma.sql`${expr} IN (${Prisma.join(f.value)})`);
+      } else if (f.operator === "none of") {
+        conditions.push(Prisma.sql`${expr} NOT IN (${Prisma.join(f.value)})`);
+      }
+    }
+  }
 
-  const timeFilter = filter.find(
-    (f) =>
-      f.column === "Start Time" && (f.operator === ">=" || f.operator === ">"),
-  );
+  if (opts.searchQuery) {
+    const pattern = `%${opts.searchQuery}%`;
+    const contentSearch = (opts.searchType ?? ["id"]).includes("content");
+    const searchConds: Prisma.Sql[] = [
+      Prisma.sql`o.id ILIKE ${pattern}`,
+      Prisma.sql`COALESCE(o.name,'') ILIKE ${pattern}`,
+      Prisma.sql`COALESCE(o.trace_id,'') ILIKE ${pattern}`,
+      Prisma.sql`COALESCE(o.parent_observation_id,'') ILIKE ${pattern}`,
+      Prisma.sql`COALESCE(o.status_message,'') ILIKE ${pattern}`,
+      Prisma.sql`COALESCE(o.provided_model_name,'') ILIKE ${pattern}`,
+    ];
+    if (contentSearch) {
+      searchConds.push(Prisma.sql`COALESCE(o.input,'') ILIKE ${pattern}`);
+      searchConds.push(Prisma.sql`COALESCE(o.output,'') ILIKE ${pattern}`);
+    }
+    conditions.push(Prisma.sql`(${Prisma.join(searchConds, " OR ")})`);
+  }
 
-  const scoresFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "scores",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-    }),
-  ]);
+  const orderExpr =
+    columnExpr(opts.orderBy?.column ?? "startTime") ?? Prisma.sql`o.start_time`;
+  const orderDir =
+    opts.orderBy?.order?.toLowerCase() === "asc"
+      ? Prisma.sql`ASC`
+      : Prisma.sql`DESC`;
 
-  const hasScoresFilter = filter.some((f) =>
-    f.column.toLowerCase().includes("score"),
-  );
+  const fromWithJoin = Prisma.sql`
+    FROM observations o
+    ${needsTraceJoin ? Prisma.sql`LEFT JOIN traces t ON t.id = o.trace_id AND t.project_id = o.project_id` : Prisma.empty}
+  `;
 
-  // query optimisation: joining traces onto observations is expensive. Hence, only join if the UI table contains filters on traces.
-  const traceTableFilter = filter.filter((f) =>
-    observationsTableTraceUiColumnDefinitions.some(
-      (c) => c.uiTableId === f.column || c.uiTableName === f.column,
-    ),
-  );
+  if (opts.select === "count") {
+    const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      ${fromWithJoin}
+      WHERE ${Prisma.join(conditions, " AND ")}
+    `);
+    return [{ count: String(Number(rows[0]?.count ?? 0n)) }] as Array<T>;
+  }
 
-  const orderByTraces = orderBy
-    ? observationsTableTraceUiColumnDefinitions.some(
-        (c) =>
-          c.uiTableId === orderBy.column || c.uiTableName === orderBy.column,
-      )
-    : undefined;
-
-  timeFilter
-    ? scoresFilter.push(
-        new DateTimeFilter({
-          clickhouseTable: "scores",
-          field: "timestamp",
-          operator: ">=",
-          value: timeFilter.value as Date,
-        }),
-      )
-    : undefined;
-
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedScoresFilter = scoresFilter.apply();
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  const search = clickhouseSearchCondition(
-    opts.searchQuery,
-    opts.searchType,
-    "o",
-  );
-
-  const scoresCte = `WITH scores_agg AS (
+  const selectRows = Prisma.sql`
     SELECT
-      trace_id,
-      observation_id,
-      -- For numeric scores, use tuples of (name, avg_value)
-      groupArrayIf(
-        tuple(name, avg_value),
-        data_type IN ('NUMERIC', 'BOOLEAN')
-      ) AS scores_avg,
-      -- For categorical scores, use name:value format for improved query performance
-      groupArrayIf(
-        concat(name, ':', string_value),
-        data_type = 'CATEGORICAL' AND notEmpty(string_value)
-      ) AS score_categories
-    FROM (
-      SELECT
-        trace_id,
-        observation_id,
-        name,
-        avg(value) avg_value,
-        string_value,
-        data_type,
-        comment
-      FROM
-        scores FINAL
-      WHERE ${appliedScoresFilter.query}
-      GROUP BY
-        trace_id,
-        observation_id,
-        name,
-        string_value,
-        data_type,
-        comment
-      ORDER BY
-        trace_id
-      ) tmp
-    GROUP BY
-      trace_id,
-      observation_id
-  )`;
+      o.id,
+      o.type::text as type,
+      o.project_id,
+      o.name,
+      o.model_parameters,
+      o.start_time,
+      o.end_time,
+      o.trace_id,
+      o.completion_start_time,
+      o.provided_usage_details,
+      o.usage_details,
+      o.provided_cost_details,
+      o.cost_details,
+      o.level::text as level,
+      o.environment,
+      o.status_message,
+      o.version,
+      o.parent_observation_id,
+      o.created_at,
+      o.updated_at,
+      o.provided_model_name,
+      o.total_cost,
+      o.usage_pricing_tier_id,
+      o.usage_pricing_tier_name,
+      o.prompt_id,
+      o.prompt_name,
+      o.prompt_version,
+      o.internal_model_id,
+      (EXTRACT(EPOCH FROM (COALESCE(o.end_time, o.start_time) - o.start_time)) * 1000)::text AS latency,
+      (EXTRACT(EPOCH FROM (COALESCE(o.completion_start_time, o.start_time) - o.start_time)) * 1000)::text AS time_to_first_token,
+      (SELECT count(*) FROM jsonb_object_keys(COALESCE(o.tool_definitions, '{}'::jsonb)))::text AS tool_definitions_count,
+      jsonb_array_length(COALESCE(o.tool_calls, '[]'::jsonb))::text AS tool_calls_count
+      ${opts.selectIOAndMetadata ? Prisma.sql`, o.input, o.output, o.metadata` : Prisma.empty}
+    ${fromWithJoin}
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY ${orderExpr} ${orderDir}
+    ${opts.limit !== undefined ? Prisma.sql`LIMIT ${opts.limit}` : Prisma.empty}
+    ${opts.offset !== undefined ? Prisma.sql`OFFSET ${opts.offset}` : Prisma.empty}
+  `;
 
-  // if we have default ordering by time, we order by toDate(o.start_time) first and then by
-  // o.start_time. This way, clickhouse is able to read more efficiently directly from disk without ordering
-  const newDefaultOrder =
-    orderBy?.column === "startTime"
-      ? [{ column: "order_by_date", order: orderBy.order }, orderBy]
-      : [orderBy ?? null];
-
-  const chOrderBy = orderByToClickhouseSql(newDefaultOrder, [
-    ...observationsTableUiColumnDefinitions,
-    {
-      uiTableName: "order_by_date",
-      uiTableId: "order_by_date",
-      clickhouseTableName: "observation",
-      clickhouseSelect: "toDate(o.start_time)",
-    },
-  ]);
-
-  // joins with traces are very expensive. We need to filter by time as well.
-  // We assume that a trace has to have been within the last 2 days to be relevant.
-
-  const query = `
-      ${scoresCte}
-      SELECT
-       ${selectString}
-      FROM observations o
-        ${traceTableFilter.length > 0 || orderByTraces || search.query ? "LEFT JOIN __TRACE_TABLE__ t FINAL ON t.id = o.trace_id AND t.project_id = o.project_id" : ""}
-        ${hasScoresFilter ? `LEFT JOIN scores_agg AS s ON s.trace_id = o.trace_id and s.observation_id = o.id` : ""}
-      WHERE ${appliedObservationsFilter.query}
-
-        ${timeFilter && (traceTableFilter.length > 0 || orderByTraces) ? `AND t.timestamp > {tracesTimestampFilter: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}` : ""}
-        ${search.query}
-      ${chOrderBy}
-      ${opts.select === "rows" && !skipDedup ? "LIMIT 1 BY o.id, o.project_id" : ""}
-      ${limit !== undefined && offset !== undefined ? `LIMIT ${limit} OFFSET ${offset}` : ""};`;
-
-  return measureAndReturn({
-    operationName: "getObservationsTableInternal",
-    projectId,
-    input: {
-      params: {
-        ...appliedScoresFilter.params,
-        ...appliedObservationsFilter.params,
-        ...(timeFilter
-          ? {
-              tracesTimestampFilter: convertDateToClickhouseDateTime(
-                timeFilter.value as Date,
-              ),
-            }
-          : {}),
-        ...search.params,
-      },
-      tags: {
-        ...(opts.tags ?? {}),
-        feature: "tracing",
-        type: "observation",
-        projectId,
-        kind: opts.select,
-        operation_name: "getObservationsTableInternal",
-      },
-    },
-    fn: async (input) => {
-      return queryClickhouse<T>({
-        query: query.replace("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: input.tags,
-        clickhouseConfigs,
-      });
-    },
-  });
+  const rows = await prisma.$queryRaw<Array<T>>(selectRows);
+  return rows;
 };
 
 export const getObservationsGroupedByModel = async (
   projectId: string,
   filter: FilterState,
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-  const query = `
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  const rows = await prisma.$queryRaw<Array<{ name: string }>>(Prisma.sql`
     SELECT o.provided_model_name as name
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    AND o.type = 'GENERATION'
+    WHERE o.project_id = ${projectId}
+      AND o.type::text = 'GENERATION'
+      AND o.provided_model_name IS NOT NULL
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
     GROUP BY o.provided_model_name
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
-
-  const res = await queryClickhouse<{ name: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res.map((r) => ({ model: r.name }));
+    ORDER BY COUNT(*) DESC
+    LIMIT 1000
+  `);
+  return rows.map((r) => ({ model: r.name }));
 };
 
 export const getObservationsGroupedByModelId = async (
   projectId: string,
   filter: FilterState,
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-  const query = `
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  const rows = await prisma.$queryRaw<Array<{ modelid: string }>>(Prisma.sql`
     SELECT o.internal_model_id as modelId
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    AND o.type = 'GENERATION'
+    WHERE o.project_id = ${projectId}
+      AND o.type::text = 'GENERATION'
+      AND o.internal_model_id IS NOT NULL
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
     GROUP BY o.internal_model_id
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
-
-  const res = await queryClickhouse<{ modelId: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res.map((r) => ({ modelId: r.modelId }));
+    ORDER BY COUNT(*) DESC
+    LIMIT 1000
+  `);
+  return rows.map((r) => ({ modelId: r.modelid ?? (r as any).modelId }));
 };
 
 export const getObservationsGroupedByName = async (
@@ -971,199 +938,115 @@ export const getObservationsGroupedByName = async (
   filter: FilterState,
   type: ObservationType | null = "GENERATION",
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-  const query = `
-    SELECT o.name as name
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  const rows = await prisma.$queryRaw<Array<{ name: string }>>(Prisma.sql`
+    SELECT o.name
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    ${type ? `AND o.type = {type: String}` : ""}
+    WHERE o.project_id = ${projectId}
+      ${type ? Prisma.sql`AND o.type::text = ${type}` : Prisma.empty}
+      AND o.name IS NOT NULL
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
     GROUP BY o.name
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
-
-  const res = await queryClickhouse<{ name: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-      ...(type ? { type } : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res;
+    ORDER BY COUNT(*) DESC
+    LIMIT 1000
+  `);
+  return rows;
 };
 
 export const getObservationsGroupedByToolName = async (
   projectId: string,
   filter: FilterState,
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  const query = `
-    SELECT arrayJoin(mapKeys(o.tool_definitions)) as toolName
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  return prisma.$queryRaw<Array<{ toolName: string }>>(Prisma.sql`
+    SELECT DISTINCT key AS "toolName"
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    AND length(mapKeys(o.tool_definitions)) > 0
-    GROUP BY toolName
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
-
-  const res = await queryClickhouse<{ toolName: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res;
+    CROSS JOIN LATERAL jsonb_object_keys(COALESCE(o.tool_definitions, '{}'::jsonb)) key
+    WHERE o.project_id = ${projectId}
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
+    LIMIT 1000
+  `);
 };
 
 export const getObservationsGroupedByCalledToolName = async (
   projectId: string,
   filter: FilterState,
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  const query = `
-    SELECT arrayJoin(o.tool_call_names) as calledToolName
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  return prisma.$queryRaw<Array<{ calledToolName: string }>>(Prisma.sql`
+    SELECT DISTINCT name AS "calledToolName"
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    AND length(o.tool_call_names) > 0
-    GROUP BY calledToolName
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
-
-  const res = await queryClickhouse<{ calledToolName: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res;
+    CROSS JOIN LATERAL unnest(COALESCE(o.tool_call_names, ARRAY[]::text[])) name
+    WHERE o.project_id = ${projectId}
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
+    LIMIT 1000
+  `);
 };
 
 export const getObservationsGroupedByPromptName = async (
   projectId: string,
   filter: FilterState,
 ) => {
-  const observationsFilter = new FilterList([
-    new StringFilter({
-      clickhouseTable: "observations",
-      field: "project_id",
-      operator: "=",
-      value: projectId,
-      tablePrefix: "o",
-    }),
-  ]);
-
-  observationsFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      observationsTableUiColumnDefinitions,
-    ),
-  );
-
-  const appliedObservationsFilter = observationsFilter.apply();
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-  const query = `
-    SELECT o.prompt_id as id
+  const timeConditions = filter
+    .filter(
+      (f) =>
+        f.type === "datetime" &&
+        (f.column === "Start Time" || f.column === "startTime"),
+    )
+    .map((f) => {
+      if (f.operator === ">=") return Prisma.sql`o.start_time >= ${f.value}`;
+      if (f.operator === ">") return Prisma.sql`o.start_time > ${f.value}`;
+      if (f.operator === "<=") return Prisma.sql`o.start_time <= ${f.value}`;
+      return Prisma.sql`o.start_time < ${f.value}`;
+    });
+  const promptRows = await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT o.prompt_id AS id
     FROM observations o
-    WHERE ${appliedObservationsFilter.query}
-    AND o.type = 'GENERATION'
-    AND o.prompt_id IS NOT NULL
+    WHERE o.project_id = ${projectId}
+      AND o.type::text = 'GENERATION'
+      AND o.prompt_id IS NOT NULL
+      ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
     GROUP BY o.prompt_id
-    ORDER BY count() DESC
-    LIMIT 1000;
-    `;
+    ORDER BY COUNT(*) DESC
+    LIMIT 1000
+  `);
 
-  const res = await queryClickhouse<{ id: string }>({
-    query,
-    params: {
-      ...appliedObservationsFilter.params,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-
-  const prompts = res.map((r) => r.id).filter((r): r is string => Boolean(r));
+  const prompts = promptRows
+    .map((r) => r.id)
+    .filter((r): r is string => Boolean(r));
 
   const pgPrompts =
     prompts.length > 0
@@ -1191,69 +1074,41 @@ export const getCostForTraces = async (
   timestamp: Date,
   traceIds: string[],
 ) => {
-  // Wrapping the query in a CTE allows us to skip FINAL which allows Clickhouse to use skip indexes.
-  const query = `
+  if (traceIds.length === 0) return undefined;
+  const lowerBound = new Date(timestamp.getTime() - 2 * 24 * 60 * 60 * 1000);
+  const rows = await prisma.$queryRaw<Array<{ total_cost: string }>>(Prisma.sql`
     WITH selected_observations AS (
-      SELECT o.total_cost as total_cost
+      SELECT DISTINCT ON (o.id, o.project_id)
+        o.total_cost
       FROM observations o
-      WHERE o.project_id = {projectId: String}
-      AND o.trace_id IN ({traceIds: Array(String)})
-      AND o.start_time >= {timestamp: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}
-      ORDER BY o.event_ts DESC
-      LIMIT 1 BY o.id, o.project_id
+      WHERE o.project_id = ${projectId}
+        AND o.trace_id IN (${Prisma.join(traceIds)})
+        AND o.start_time >= ${lowerBound}
+      ORDER BY o.id, o.project_id, o.event_ts DESC
     )
-
-    SELECT sum(total_cost) as total_cost
+    SELECT COALESCE(SUM(total_cost), 0)::text AS total_cost
     FROM selected_observations
- `;
-
-  const res = await queryClickhouse<{ total_cost: string }>({
-    query,
-    params: {
-      projectId,
-      traceIds,
-      timestamp: convertDateToClickhouseDateTime(timestamp),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-  return res.length > 0 ? Number(res[0].total_cost) : undefined;
+  `);
+  return rows.length > 0 ? Number(rows[0].total_cost) : undefined;
 };
 
 export const deleteObservationsByTraceIds = async (
   projectId: string,
   traceIds: string[],
 ) => {
-  const preflight = await queryClickhouse<{
-    min_ts: string;
-    max_ts: string;
-    cnt: string;
-  }>({
-    query: `
-      SELECT
-        min(start_time) - INTERVAL 1 HOUR as min_ts,
-        max(start_time) + INTERVAL 1 HOUR as max_ts,
-        count(*) as cnt
-      FROM observations
-      WHERE project_id = {projectId: String} AND trace_id IN ({traceIds: Array(String)})
-    `,
-    params: { projectId, traceIds },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "delete-preflight",
-      projectId,
-    },
-  });
+  const preflight = await prisma.$queryRaw<
+    Array<{ min_ts: Date | null; max_ts: Date | null; cnt: bigint }>
+  >(Prisma.sql`
+    SELECT
+      (min(start_time) - INTERVAL '1 hour') as min_ts,
+      (max(start_time) + INTERVAL '1 hour') as max_ts,
+      count(*)::bigint as cnt
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
+  `);
 
-  const count = Number(preflight[0]?.cnt ?? 0);
+  const count = Number(preflight[0]?.cnt ?? 0n);
   if (count === 0) {
     logger.info(
       `deleteObservationsByTraceIds: no rows found for project ${projectId}, skipping DELETE`,
@@ -1261,51 +1116,22 @@ export const deleteObservationsByTraceIds = async (
     return;
   }
 
-  await commandClickhouse({
-    query: `
-      DELETE FROM observations
-      WHERE project_id = {projectId: String}
-      AND trace_id IN ({traceIds: Array(String)})
-      AND start_time >= {minTs: String}::DateTime64(3)
-      AND start_time <= {maxTs: String}::DateTime64(3)
-    `,
-    params: {
-      projectId,
-      traceIds,
-      minTs: preflight[0].min_ts,
-      maxTs: preflight[0].max_ts,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "delete",
-      projectId,
-    },
-  });
+  await prisma.$executeRaw`
+    DELETE FROM observations
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
+      AND start_time >= ${preflight[0].min_ts}
+      AND start_time <= ${preflight[0].max_ts}
+  `;
 };
 
 export const hasAnyObservation = async (projectId: string) => {
-  const query = `
-    SELECT 1
+  const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+    SELECT 1 as one
     FROM observations
-    WHERE project_id = {projectId: String}
+    WHERE project_id = ${projectId}
     LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<{ 1: number }>({
-    query,
-    params: { projectId },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "hasAny",
-      projectId,
-    },
-  });
-
+  `);
   return rows.length > 0;
 };
 
@@ -1317,25 +1143,10 @@ export const deleteObservationsByProjectId = async (
     return false;
   }
 
-  const query = `
+  await prisma.$executeRaw`
     DELETE FROM observations
-    WHERE project_id = {projectId: String};
+    WHERE project_id = ${projectId}
   `;
-  const tags = {
-    feature: "tracing",
-    type: "observation",
-    kind: "delete",
-    projectId,
-  };
-
-  await commandClickhouse({
-    query,
-    params: { projectId },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags,
-  });
 
   return true;
 };
@@ -1344,27 +1155,13 @@ export const hasAnyObservationOlderThan = async (
   projectId: string,
   beforeDate: Date,
 ) => {
-  const query = `
-    SELECT 1
+  const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+    SELECT 1 as one
     FROM observations
-    WHERE project_id = {projectId: String}
-    AND start_time < {cutoffDate: DateTime64(3)}
+    WHERE project_id = ${projectId}
+      AND start_time < ${beforeDate}
     LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<{ 1: number }>({
-    query,
-    params: {
-      projectId,
-      cutoffDate: convertDateToClickhouseDateTime(beforeDate),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "hasAnyOlderThan",
-      projectId,
-    },
-  });
+  `);
 
   return rows.length > 0;
 };
@@ -1378,27 +1175,11 @@ export const deleteObservationsOlderThanDays = async (
     return false;
   }
 
-  const query = `
+  await prisma.$executeRaw`
     DELETE FROM observations
-    WHERE project_id = {projectId: String}
-    AND start_time < {cutoffDate: DateTime64(3)};
+    WHERE project_id = ${projectId}
+      AND start_time < ${beforeDate}
   `;
-  await commandClickhouse({
-    query: query,
-    params: {
-      projectId,
-      cutoffDate: convertDateToClickhouseDateTime(beforeDate),
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "delete",
-      projectId,
-    },
-  });
 
   return true;
 };
@@ -1407,27 +1188,18 @@ export const getObservationsWithPromptName = async (
   projectId: string,
   promptNames: string[],
 ) => {
-  const query = `
-  SELECT uniq(id) as count, prompt_name
-  FROM observations
-  WHERE project_id = {projectId: String}
-  AND prompt_name IN ({promptNames: Array(String)})
-  AND prompt_name IS NOT NULL
-  GROUP BY prompt_name
-`;
-  const rows = await queryClickhouse<{ count: string; prompt_name: string }>({
-    query: query,
-    params: {
-      projectId,
-      promptNames,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "list",
-      projectId,
-    },
-  });
+  if (promptNames.length === 0) return [];
+
+  const rows = await prisma.$queryRaw<
+    Array<{ count: bigint; prompt_name: string }>
+  >(Prisma.sql`
+    SELECT count(DISTINCT id)::bigint as count, prompt_name
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND prompt_name IN (${Prisma.join(promptNames)})
+      AND prompt_name IS NOT NULL
+    GROUP BY prompt_name
+  `);
 
   return rows.map((r) => ({
     count: Number(r.count),
@@ -1439,70 +1211,66 @@ export const getObservationMetricsForPrompts = async (
   projectId: string,
   promptIds: string[],
 ) => {
-  const query = `
-      WITH latencies AS
-          (
-              SELECT
-                  prompt_id,
-                  prompt_version,
-                  start_time,
-                  end_time,
-                  usage_details,
-                  cost_details,
-                  dateDiff('millisecond', start_time, end_time) AS latency_ms
-              FROM observations
-              FINAL
-              WHERE (type = 'GENERATION')
-              AND (prompt_name IS NOT NULL)
-              AND project_id={projectId: String}
-              AND prompt_id IN ({promptIds: Array(String)})
-          )
+  if (promptIds.length === 0) return [];
+
+  const rows = await prisma.$queryRaw<
+    Array<{
+      count: bigint;
+      prompt_id: string;
+      prompt_version: number | null;
+      first_observation: Date;
+      last_observation: Date;
+      median_input_usage: string;
+      median_output_usage: string;
+      median_total_cost: string;
+      median_latency_ms: string;
+    }>
+  >(Prisma.sql`
+    WITH latencies AS (
       SELECT
-          count(*) AS count,
-          prompt_id,
-          prompt_version,
-          min(start_time) AS first_observation,
-          max(start_time) AS last_observation,
-          medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, usage_details)))) AS median_input_usage,
-          medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, usage_details)))) AS median_output_usage,
-          medianExact(cost_details['total']) AS median_total_cost,
-          medianExact(latency_ms) AS median_latency_ms
-      FROM latencies
-      GROUP BY
-          prompt_id,
-          prompt_version
-      ORDER BY prompt_version DESC
-`;
-  const rows = await queryClickhouse<{
-    count: string;
-    prompt_id: string;
-    prompt_version: number;
-    first_observation: string;
-    last_observation: string;
-    median_input_usage: string;
-    median_output_usage: string;
-    median_total_cost: string;
-    median_latency_ms: string;
-  }>({
-    query: query,
-    params: {
-      projectId,
-      promptIds,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
+        o.prompt_id,
+        o.prompt_version,
+        o.start_time,
+        o.end_time,
+        COALESCE((
+          SELECT SUM(v::numeric)
+          FROM jsonb_each_text(COALESCE(o.usage_details, '{}'::jsonb)) as kv(k, v)
+          WHERE LOWER(k) LIKE '%input%'
+        ), 0) AS input_usage,
+        COALESCE((
+          SELECT SUM(v::numeric)
+          FROM jsonb_each_text(COALESCE(o.usage_details, '{}'::jsonb)) as kv(k, v)
+          WHERE LOWER(k) LIKE '%output%'
+        ), 0) AS output_usage,
+        COALESCE((o.cost_details->>'total')::numeric, 0) AS total_cost,
+        (EXTRACT(EPOCH FROM (COALESCE(o.end_time, o.start_time) - o.start_time)) * 1000) AS latency_ms
+      FROM observations o
+      WHERE o.type::text = 'GENERATION'
+        AND o.prompt_name IS NOT NULL
+        AND o.project_id = ${projectId}
+        AND o.prompt_id IN (${Prisma.join(promptIds)})
+    )
+    SELECT
+      count(*)::bigint AS count,
+      prompt_id,
+      prompt_version,
+      min(start_time) AS first_observation,
+      max(start_time) AS last_observation,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY input_usage)::text AS median_input_usage,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY output_usage)::text AS median_output_usage,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY total_cost)::text AS median_total_cost,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::text AS median_latency_ms
+    FROM latencies
+    GROUP BY prompt_id, prompt_version
+    ORDER BY prompt_version DESC NULLS LAST
+  `);
 
   return rows.map((r) => ({
     count: Number(r.count),
     promptId: r.prompt_id,
-    promptVersion: r.prompt_version,
-    firstObservation: parseClickhouseUTCDateTimeFormat(r.first_observation),
-    lastObservation: parseClickhouseUTCDateTimeFormat(r.last_observation),
+    promptVersion: r.prompt_version ?? 0,
+    firstObservation: r.first_observation,
+    lastObservation: r.last_observation,
     medianInputUsage: Number(r.median_input_usage),
     medianOutputUsage: Number(r.median_output_usage),
     medianTotalCost: Number(r.median_total_cost),
@@ -1515,36 +1283,20 @@ export const getLatencyAndTotalCostForObservations = async (
   observationIds: string[],
   timestamp?: Date,
 ) => {
-  const query = `
+  if (observationIds.length === 0) return [];
+
+  const rows = await prisma.$queryRaw<
+    Array<{ id: string; total_cost: string; latency_ms: string }>
+  >(Prisma.sql`
     SELECT
-        id,
-        cost_details['total'] AS total_cost,
-        dateDiff('millisecond', start_time, end_time) AS latency_ms
-    FROM observations FINAL
-    WHERE project_id = {projectId: String}
-    AND id IN ({observationIds: Array(String)})
-    ${timestamp ? `AND start_time >= {timestamp: DateTime64(3)}` : ""}
-`;
-  const rows = await queryClickhouse<{
-    id: string;
-    total_cost: string;
-    latency_ms: string;
-  }>({
-    query: query,
-    params: {
-      projectId,
-      observationIds,
-      ...(timestamp
-        ? { timestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
+      id,
+      COALESCE((cost_details->>'total')::numeric, 0)::text AS total_cost,
+      COALESCE((EXTRACT(EPOCH FROM (COALESCE(end_time, start_time) - start_time)) * 1000), 0)::text AS latency_ms
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND id IN (${Prisma.join(observationIds)})
+      ${timestamp ? Prisma.sql`AND start_time >= ${timestamp}` : Prisma.empty}
+  `);
 
   return rows.map((r) => ({
     id: r.id,
@@ -1558,37 +1310,21 @@ export const getLatencyAndTotalCostForObservationsByTraces = async (
   traceIds: string[],
   timestamp?: Date,
 ) => {
-  const query = `
+  if (traceIds.length === 0) return [];
+
+  const rows = await prisma.$queryRaw<
+    Array<{ trace_id: string; total_cost: string; latency_ms: string }>
+  >(Prisma.sql`
     SELECT
-        trace_id,
-        sumMap(cost_details)['total'] AS total_cost,
-        dateDiff('millisecond', min(start_time), max(end_time)) AS latency_ms
-    FROM observations FINAL
-    WHERE project_id = {projectId: String}
-    AND trace_id IN ({traceIds: Array(String)})
-    ${timestamp ? `AND start_time >= {timestamp: DateTime64(3)}` : ""}
+      trace_id,
+      COALESCE(SUM((cost_details->>'total')::numeric), 0)::text AS total_cost,
+      COALESCE((EXTRACT(EPOCH FROM (MAX(COALESCE(end_time, start_time)) - MIN(start_time))) * 1000), 0)::text AS latency_ms
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
+      ${timestamp ? Prisma.sql`AND start_time >= ${timestamp}` : Prisma.empty}
     GROUP BY trace_id
-`;
-  const rows = await queryClickhouse<{
-    trace_id: string;
-    total_cost: string;
-    latency_ms: string;
-  }>({
-    query: query,
-    params: {
-      projectId,
-      traceIds,
-      ...(timestamp
-        ? { timestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
+  `);
 
   return rows.map((r) => ({
     traceId: r.trace_id,
@@ -1623,45 +1359,44 @@ export const getObservationsGroupedByTraceId = async (
 ): Promise<Map<string, ObservationTuple[]>> => {
   if (traceIds.length === 0) return new Map();
 
-  const query = `
+  const rows = await prisma.$queryRaw<
+    Array<{
+      trace_id: string;
+      id: string;
+      parent_observation_id: string | null;
+      total_cost: string;
+      input_cost: string;
+      output_cost: string;
+      latency_ms: number;
+    }>
+  >(Prisma.sql`
     SELECT
-        trace_id,
-        groupArray((
-          id,
-          parent_observation_id,
-          cost_details['total'],
-          cost_details['input'],
-          cost_details['output'],
-          dateDiff('millisecond', start_time, end_time)
-        )) AS observations
-    FROM observations FINAL
-    WHERE project_id = {projectId: String}
-    AND trace_id IN ({traceIds: Array(String)})
-    ${timestamp ? `AND start_time >= {timestamp: DateTime64(3)}` : ""}
-    GROUP BY trace_id
-  `;
+      trace_id,
+      id,
+      parent_observation_id,
+      COALESCE((cost_details->>'total')::numeric, 0)::text AS total_cost,
+      COALESCE((cost_details->>'input')::numeric, 0)::text AS input_cost,
+      COALESCE((cost_details->>'output')::numeric, 0)::text AS output_cost,
+      COALESCE((EXTRACT(EPOCH FROM (COALESCE(end_time, start_time) - start_time)) * 1000), 0)::int AS latency_ms
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
+      ${timestamp ? Prisma.sql`AND start_time >= ${timestamp}` : Prisma.empty}
+  `);
 
-  const groupedObservations = await queryClickhouse<{
-    trace_id: string;
-    observations: ObservationTuple[];
-  }>({
-    query,
-    params: {
-      projectId,
-      traceIds,
-      ...(timestamp
-        ? { timestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
-
-  return new Map(groupedObservations.map((g) => [g.trace_id, g.observations]));
+  const map = new Map<string, ObservationTuple[]>();
+  for (const r of rows) {
+    const tuple: ObservationTuple = [
+      r.id,
+      r.parent_observation_id,
+      r.total_cost,
+      r.input_cost,
+      r.output_cost,
+      r.latency_ms,
+    ];
+    map.set(r.trace_id, [...(map.get(r.trace_id) ?? []), tuple]);
+  }
+  return map;
 };
 
 export const getObservationCountsByProjectInCreationInterval = async ({
@@ -1671,28 +1406,17 @@ export const getObservationCountsByProjectInCreationInterval = async ({
   start: Date;
   end: Date;
 }) => {
-  const query = `
-    SELECT
-      project_id,
-      count(*) as count
-    FROM observations
-    WHERE created_at >= {start: DateTime64(3)}
-    AND created_at < {end: DateTime64(3)}
-    GROUP BY project_id
-  `;
-
-  const rows = await queryClickhouse<{ project_id: string; count: string }>({
-    query,
-    params: {
-      start: convertDateToClickhouseDateTime(start),
-      end: convertDateToClickhouseDateTime(end),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-    },
-  });
+  const rows = await prisma.$queryRaw<
+    Array<{ project_id: string; count: bigint }>
+  >(
+    Prisma.sql`
+      SELECT project_id, count(*)::bigint as count
+      FROM observations
+      WHERE created_at >= ${start}
+        AND created_at < ${end}
+      GROUP BY project_id
+    `,
+  );
 
   return rows.map((row) => ({
     projectId: row.project_id,
@@ -1707,56 +1431,31 @@ export const getObservationCountOfProjectsSinceCreationDate = async ({
   projectIds: string[];
   start: Date;
 }) => {
-  const query = `
-    SELECT
-      count(*) as count
+  if (projectIds.length === 0) return 0;
+
+  const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT count(*)::bigint as count
     FROM observations
-    WHERE project_id IN ({projectIds: Array(String)})
-    AND created_at >= {start: DateTime64(3)}
-  `;
-
-  const rows = await queryClickhouse<{ count: string }>({
-    query,
-    params: {
-      projectIds,
-      start: convertDateToClickhouseDateTime(start),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-    },
-  });
-
-  return Number(rows[0]?.count ?? 0);
+    WHERE project_id IN (${Prisma.join(projectIds)})
+      AND created_at >= ${start}
+  `);
+  return Number(rows[0]?.count ?? 0n);
 };
 
 export const getTraceIdsForObservations = async (
   projectId: string,
   observationIds: string[],
 ) => {
-  const query = `
-    SELECT
-      trace_id,
-      id
-    FROM observations
-    WHERE project_id = {projectId: String}
-    AND id IN ({observationIds: Array(String)})
-  `;
+  if (observationIds.length === 0) return [];
 
-  const rows = await queryClickhouse<{ id: string; trace_id: string }>({
-    query,
-    params: {
-      projectId,
-      observationIds,
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "list",
-      projectId,
-    },
-  });
+  const rows = await prisma.$queryRaw<
+    Array<{ id: string; trace_id: string }>
+  >(Prisma.sql`
+    SELECT trace_id, id
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND id IN (${Prisma.join(observationIds)})
+  `);
 
   return rows.map((row) => ({
     id: row.id,
@@ -1769,55 +1468,44 @@ export const getObservationsForBlobStorageExport = function (
   minTimestamp: Date,
   maxTimestamp: Date,
 ) {
-  const query = `
-    SELECT
-      id,
-      trace_id,
-      project_id,
-      environment,
-      type,
-      parent_observation_id,
-      start_time,
-      end_time,
-      name,
-      metadata,
-      level,
-      status_message,
-      version,
-      input,
-      output,
-      provided_model_name,
-      model_parameters,
-      usage_details,
-      cost_details,
-      completion_start_time,
-      prompt_name,
-      prompt_version
-    FROM observations FINAL
-    WHERE project_id = {projectId: String}
-    AND start_time >= {minTimestamp: DateTime64(3)}
-    AND start_time <= {maxTimestamp: DateTime64(3)}
-  `;
+  const iterator = (async function* () {
+    const rows = await prisma.$queryRaw<Record<string, unknown>[]>(Prisma.sql`
+      SELECT
+        id,
+        trace_id,
+        project_id,
+        environment,
+        type::text as type,
+        parent_observation_id,
+        start_time,
+        end_time,
+        name,
+        metadata,
+        level::text as level,
+        status_message,
+        version,
+        input,
+        output,
+        provided_model_name,
+        model_parameters,
+        usage_details,
+        cost_details,
+        completion_start_time,
+        prompt_name,
+        prompt_version
+      FROM observations
+      WHERE project_id = ${projectId}
+        AND start_time >= ${minTimestamp}
+        AND start_time <= ${maxTimestamp}
+      ORDER BY start_time ASC
+    `);
 
-  const records = queryClickhouseStream<Record<string, unknown>>({
-    query,
-    params: {
-      projectId,
-      minTimestamp: convertDateToClickhouseDateTime(minTimestamp),
-      maxTimestamp: convertDateToClickhouseDateTime(maxTimestamp),
-    },
-    tags: {
-      feature: "blobstorage",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DATA_EXPORT_REQUEST_TIMEOUT_MS,
-    },
-  });
+    for (const row of rows) {
+      yield row;
+    }
+  })();
 
-  return records;
+  return iterator;
 };
 
 export const getGenerationsForAnalyticsIntegrations = async function* (
@@ -1826,22 +1514,26 @@ export const getGenerationsForAnalyticsIntegrations = async function* (
   minTimestamp: Date,
   maxTimestamp: Date,
 ) {
-  const traceTable = "traces";
-
-  const query = `
+  const records = await prisma.$queryRaw<Record<string, unknown>[]>(Prisma.sql`
     SELECT
       o.name as name,
       o.start_time as start_time,
       o.id as id,
       o.total_cost as total_cost,
-      if(isNull(completion_start_time), NULL, date_diff('millisecond', start_time, completion_start_time)) as time_to_first_token,
-      o.usage_details['total'] as input_tokens,
-      o.usage_details['output'] as output_tokens,
-      o.cost_details['total'] as total_tokens,
+      CASE
+        WHEN o.completion_start_time IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM (o.completion_start_time - o.start_time)) * 1000)
+      END as time_to_first_token,
+      (o.usage_details->>'total') as input_tokens,
+      (o.usage_details->>'output') as output_tokens,
+      (o.cost_details->>'total') as total_tokens,
       o.project_id as project_id,
-      if(isNull(end_time), NULL, date_diff('millisecond', start_time, end_time) / 1000) as latency,
+      CASE
+        WHEN o.end_time IS NULL THEN NULL
+        ELSE EXTRACT(EPOCH FROM (o.end_time - o.start_time))
+      END as latency,
       o.provided_model_name as model,
-      o.level as level,
+      o.level::text as level,
       o.version as version,
       o.environment as environment,
       t.id as trace_id,
@@ -1850,43 +1542,21 @@ export const getGenerationsForAnalyticsIntegrations = async function* (
       t.user_id as trace_user_id,
       t.release as trace_release,
       t.tags as trace_tags,
-      t.metadata['$posthog_session_id'] as posthog_session_id,
-      t.metadata['$mixpanel_session_id'] as mixpanel_session_id
-    FROM observations o FINAL
-    LEFT JOIN ${traceTable} t FINAL ON o.trace_id = t.id AND o.project_id = t.project_id
-    WHERE o.project_id = {projectId: String}
-    AND t.project_id = {projectId: String}
-    AND o.start_time >= {minTimestamp: DateTime64(3)}
-    AND o.start_time <= {maxTimestamp: DateTime64(3)}
-    AND t.timestamp >= {minTimestamp: DateTime64(3)} - INTERVAL 7 DAY
-    AND t.timestamp <= {maxTimestamp: DateTime64(3)}
-    AND o.type = 'GENERATION'
-  `;
-
-  const records = queryClickhouseStream<Record<string, unknown>>({
-    query,
-    params: {
-      projectId,
-      minTimestamp: convertDateToClickhouseDateTime(minTimestamp),
-      maxTimestamp: convertDateToClickhouseDateTime(maxTimestamp),
-    },
-    tags: {
-      feature: "posthog",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DATA_EXPORT_REQUEST_TIMEOUT_MS,
-      clickhouse_settings: {
-        join_algorithm: "grace_hash",
-        grace_hash_join_initial_buckets: "32",
-      },
-    },
-  });
+      t.metadata->>'$posthog_session_id' as posthog_session_id,
+      t.metadata->>'$mixpanel_session_id' as mixpanel_session_id
+    FROM observations o
+    LEFT JOIN traces t ON o.trace_id = t.id AND o.project_id = t.project_id
+    WHERE o.project_id = ${projectId}
+      AND t.project_id = ${projectId}
+      AND o.start_time >= ${minTimestamp}
+      AND o.start_time <= ${maxTimestamp}
+      AND t.timestamp >= (${minTimestamp} - INTERVAL '7 days')
+      AND t.timestamp <= ${maxTimestamp}
+      AND o.type::text = 'GENERATION'
+  `);
 
   const baseUrl = env.NEXTAUTH_URL?.replace("/api/auth", "");
-  for await (const record of records) {
+  for (const record of records) {
     yield {
       timestamp: record.start_time,
       langfuse_generation_name: record.name,
@@ -1937,7 +1607,7 @@ export const getGenerationsForAnalyticsIntegrations = async function* (
  *   endDate: new Date('2024-03-03T00:00:00Z')
  * });
  *
- * Note: Skips using FINAL (double counting risk) for faster and cheaper
+ * Note: Uses non-deduplicating reads for faster and cheaper queries.
  * queries against clickhouse. Generous 4x overcompensation before blocking allows
  * for usage aggregation to be meaningful.
  */
@@ -1948,33 +1618,18 @@ export const getObservationCountsByProjectAndDay = async ({
   startDate: Date;
   endDate: Date;
 }) => {
-  const query = `
+  const rows = await prisma.$queryRaw<
+    Array<{ count: bigint; project_id: string; date: string }>
+  >(Prisma.sql`
     SELECT
-      count(*) as count,
+      count(*)::bigint as count,
       project_id,
-      toDate(start_time) as date
+      DATE(start_time)::text as date
     FROM observations
-    WHERE start_time >= {startDate: DateTime64(3)}
-    AND start_time < {endDate: DateTime64(3)}
-    GROUP BY project_id, toDate(start_time)
-  `;
-
-  const rows = await queryClickhouse<{
-    count: string;
-    project_id: string;
-    date: string;
-  }>({
-    query,
-    params: {
-      startDate: convertDateToClickhouseDateTime(startDate),
-      endDate: convertDateToClickhouseDateTime(endDate),
-    },
-    tags: {
-      feature: "tracing",
-      type: "observation",
-      kind: "analytic",
-    },
-  });
+    WHERE start_time >= ${startDate}
+      AND start_time < ${endDate}
+    GROUP BY project_id, DATE(start_time)
+  `);
 
   return rows.map((row) => ({
     count: Number(row.count),
@@ -1996,34 +1651,19 @@ export const getCostByEvaluatorIds = async (
 ): Promise<Array<{ evaluatorId: string; totalCost: number }>> => {
   if (evaluatorIds.length === 0) return [];
 
-  const query = `
+  const rows = await prisma.$queryRaw<
+    Array<{ evaluator_id: string; total_cost: string | number }>
+  >(Prisma.sql`
     SELECT
-      metadata['job_configuration_id'] as evaluator_id,
-      sum(total_cost) as total_cost
-    FROM observations FINAL
-    WHERE project_id = {projectId: String}
-      AND metadata['job_configuration_id'] IN ({evaluatorIds: Array(String)})
-      AND type = 'GENERATION'
-      AND start_time > today() - 7
-    GROUP BY metadata['job_configuration_id']
-  `;
-
-  const rows = await queryClickhouse<{
-    evaluator_id: string;
-    total_cost: string;
-  }>({
-    query,
-    params: {
-      projectId,
-      evaluatorIds,
-    },
-    tags: {
-      feature: "evals",
-      type: "observation",
-      kind: "analytic",
-      projectId,
-    },
-  });
+      metadata->>'job_configuration_id' as evaluator_id,
+      COALESCE(SUM(total_cost), 0)::text as total_cost
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND metadata->>'job_configuration_id' IN (${Prisma.join(evaluatorIds)})
+      AND type::text = 'GENERATION'
+      AND start_time > (NOW() - INTERVAL '7 days')
+    GROUP BY metadata->>'job_configuration_id'
+  `);
 
   return rows.map((row) => ({
     evaluatorId: row.evaluator_id,

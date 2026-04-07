@@ -7,10 +7,10 @@ import {
   type FilterState,
   type ColumnDefinition,
   type OrderByState,
-  type TableViewPresetState,
   type TableViewPresetTableName,
   type TracingSearchType,
 } from "@langfuse/shared";
+import type { TableViewPresetState } from "@/src/components/table/table-view-presets/types";
 import {
   type RowSelectionState,
   type ColumnOrderState,
@@ -160,8 +160,8 @@ export function DataTableToolbar<TData, TValue>({
   const { open: controlsPanelOpen, setOpen: setControlsPanelOpen } =
     useDataTableControls();
 
-  // Only show the toggle button when we're using the new sidebar
-  const hasNewSidebar = !filterColumnDefinition && filterState !== undefined;
+  // Filters sidebar toggle disabled for lightweight tracing UI
+  const hasNewSidebar = false;
   return (
     <div className={cn("grid h-fit w-full gap-0 px-2", className)}>
       <div className="my-2 flex flex-wrap items-center gap-2 @container">

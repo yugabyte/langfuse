@@ -1,20 +1,5 @@
-import {
-  commandClickhouse,
-  parseClickhouseUTCDateTimeFormat,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
-import {
-  createFilterFromFilterState,
-  getProjectIdDefaultFilter,
-} from "../queries/clickhouse-sql/factory";
+import { parseClickhouseUTCDateTimeFormat } from "./clickhouse";
 import { FilterState } from "../../types";
-import {
-  DateTimeFilter,
-  FilterList,
-  StringFilter,
-} from "../queries/clickhouse-sql/clickhouse-filter";
 import { TraceRecordReadType } from "./definitions";
 import { tracesTableUiColumnDefinitions } from "../tableMappings/mapTracesTable";
 import { UiColumnMappings } from "../../tableDefinitions";
@@ -23,11 +8,6 @@ import {
   PreferredClickhouseService,
 } from "../clickhouse/client";
 import { convertClickhouseToDomain } from "./traces_converters";
-import { clickhouseSearchCondition } from "../queries/clickhouse-sql/search";
-import {
-  OBSERVATIONS_TO_TRACE_INTERVAL,
-  TRACE_TO_OBSERVATIONS_INTERVAL,
-} from "./constants";
 import { env } from "../../env";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { recordDistribution } from "../instrumentation";
@@ -36,7 +16,88 @@ import { measureAndReturn } from "../clickhouse/measureAndReturn";
 import { DEFAULT_RENDERING_PROPS, RenderingProps } from "../utils/rendering";
 import { logger } from "../logger";
 import { traceException } from "../instrumentation";
-import { prisma } from "../../db";
+import { prisma as metadataPrisma, tracingPrisma as prisma } from "../../db";
+import { Prisma } from "@prisma/client";
+
+const toClickhouseDateTimeString = (value: Date | null | undefined) =>
+  value ? value.toISOString().replace("T", " ").replace("Z", "") : undefined;
+
+const serializeErrorForLogs = (error: unknown) => {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { message: String(error) };
+};
+
+const stringifyErrorForMessage = (error: unknown) =>
+  JSON.stringify(serializeErrorForLogs(error));
+
+const toClickhouseMetadataRecord = (value: unknown): Record<string, string> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+      k,
+      typeof v === "string" ? v : JSON.stringify(v),
+    ]),
+  );
+};
+
+const parseDateInput = (value: unknown) => {
+  if (value instanceof Date) return value;
+  if (typeof value === "number") return new Date(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return new Date(Number(value));
+  }
+  return parseClickhouseUTCDateTimeFormat(String(value));
+};
+
+type PgTraceRow = {
+  id: string;
+  name: string | null;
+  user_id: string | null;
+  metadata: Record<string, unknown> | null;
+  release: string | null;
+  version: string | null;
+  project_id: string;
+  environment: string | null;
+  public: boolean;
+  bookmarked: boolean;
+  tags: string[] | null;
+  input: string | null;
+  output: string | null;
+  session_id: string | null;
+  is_deleted: boolean;
+  timestamp: Date;
+  created_at: Date;
+  updated_at: Date;
+  event_ts: Date;
+};
+
+const toTraceRecordReadType = (trace: PgTraceRow): TraceRecordReadType => ({
+  id: trace.id,
+  name: trace.name,
+  user_id: trace.user_id,
+  metadata: toClickhouseMetadataRecord(trace.metadata),
+  release: trace.release,
+  version: trace.version,
+  project_id: trace.project_id,
+  environment: trace.environment ?? "default",
+  public: trace.public,
+  bookmarked: trace.bookmarked,
+  tags: trace.tags ?? [],
+  input: trace.input,
+  output: trace.output,
+  session_id: trace.session_id,
+  is_deleted: trace.is_deleted ? 1 : 0,
+  timestamp: toClickhouseDateTimeString(trace.timestamp) ?? "",
+  created_at: toClickhouseDateTimeString(trace.created_at) ?? "",
+  updated_at: toClickhouseDateTimeString(trace.updated_at) ?? "",
+  event_ts: toClickhouseDateTimeString(trace.event_ts) ?? "",
+});
 
 /**
  * Checks if trace exists in clickhouse.
@@ -69,121 +130,73 @@ export const checkTraceExistsAndGetTimestamp = async ({
   maxTimeStamp: Date | undefined;
   exactTimestamp?: Date;
 }): Promise<{ exists: boolean; timestamp?: Date }> => {
-  const { tracesFilter } = getProjectIdDefaultFilter(projectId, {
-    tracesPrefix: "t",
-  });
+  if (filter.length > 0) {
+    logger.warn(
+      "checkTraceExistsAndGetTimestamp ignores non-time filter predicates in PostgreSQL mode",
+      { projectId, traceId },
+    );
+  }
 
-  const timeStampFilter = tracesFilter.find(
-    (f) =>
-      f.field === "timestamp" && (f.operator === ">=" || f.operator === ">"),
-  ) as DateTimeFilter | undefined;
+  const timestampWhere: { gte?: Date; lte?: Date; lt?: Date } = {};
+  if (timestamp) {
+    timestampWhere.gte = new Date(
+      timestamp.getTime() - 2 * 24 * 60 * 60 * 1000,
+    );
+  }
+  if (maxTimeStamp) {
+    timestampWhere.lte = maxTimeStamp;
+  }
+  if (exactTimestamp) {
+    const exactStart = new Date(
+      Date.UTC(
+        exactTimestamp.getUTCFullYear(),
+        exactTimestamp.getUTCMonth(),
+        exactTimestamp.getUTCDate(),
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+    const exactEnd = new Date(
+      Date.UTC(
+        exactTimestamp.getUTCFullYear(),
+        exactTimestamp.getUTCMonth(),
+        exactTimestamp.getUTCDate() + 1,
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+    timestampWhere.gte = exactStart;
+    timestampWhere.lt = exactEnd;
+  }
 
-  tracesFilter.push(
-    ...createFilterFromFilterState(filter, tracesTableUiColumnDefinitions),
-    new StringFilter({
-      clickhouseTable: "t",
-      field: "id",
-      operator: "=",
-      value: traceId,
-    }),
-  );
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`id = ${traceId}`,
+    Prisma.sql`project_id = ${projectId}`,
+  ];
+  if (timestampWhere.gte) {
+    conditions.push(Prisma.sql`timestamp >= ${timestampWhere.gte}`);
+  }
+  if (timestampWhere.lte) {
+    conditions.push(Prisma.sql`timestamp <= ${timestampWhere.lte}`);
+  }
+  if (timestampWhere.lt) {
+    conditions.push(Prisma.sql`timestamp < ${timestampWhere.lt}`);
+  }
 
-  const observationFilter = tracesFilter.find(
-    (f) => f.clickhouseTable === "observations",
-  );
-  const tracesFilterRes = tracesFilter.apply();
-  const observationFilterRes = observationFilter?.apply();
+  const rows = await prisma.$queryRaw<Array<{ timestamp: Date }>>(Prisma.sql`
+    SELECT timestamp
+    FROM traces
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `);
+  const row = rows[0];
 
-  const observations_cte = `
-    WITH observations_agg AS (
-      SELECT
-        multiIf(
-          arrayExists(x -> x = 'ERROR', groupArray(level)), 'ERROR',
-          arrayExists(x -> x = 'WARNING', groupArray(level)), 'WARNING',
-          arrayExists(x -> x = 'DEFAULT', groupArray(level)), 'DEFAULT',
-          'DEBUG'
-        ) AS aggregated_level,
-        countIf(level = 'ERROR') as error_count,
-        countIf(level = 'WARNING') as warning_count,
-        countIf(level = 'DEFAULT') as default_count,
-        countIf(level = 'DEBUG') as debug_count,
-        date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds,
-        sumMap(usage_details) as usage_details,
-        sumMap(cost_details) as cost_details,
-        trace_id,
-        project_id
-      FROM observations o FINAL
-      WHERE o.project_id = {projectId: String}
-        ${timeStampFilter ? `AND o.start_time >= {traceTimestamp: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}` : ""}
-        AND o.start_time >= {timestamp: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}
-      GROUP BY trace_id, project_id
-    )
-  `;
-
-  return measureAndReturn({
-    operationName: "checkTraceExistsAndGetTimestamp",
-    projectId,
-    input: {
-      params: {
-        projectId,
-        ...tracesFilterRes.params,
-        ...(observationFilterRes ? observationFilterRes.params : {}),
-        ...(timestamp
-          ? { timestamp: convertDateToClickhouseDateTime(timestamp) }
-          : {}),
-        ...(maxTimeStamp
-          ? { maxTimeStamp: convertDateToClickhouseDateTime(maxTimeStamp) }
-          : {}),
-        ...(exactTimestamp
-          ? { exactTimestamp: convertDateToClickhouseDateTime(exactTimestamp) }
-          : {}),
-      },
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "exists",
-        projectId,
-        operation_name: "checkTraceExistsAndGetTimestamp",
-      },
-      timestamp: timestamp ?? exactTimestamp,
-    },
-    fn: async (input) => {
-      const query = `
-        ${observations_cte}
-        SELECT
-          t.id as id,
-          t.project_id as project_id,
-          t.timestamp as timestamp
-        FROM traces t FINAL
-        ${observationFilterRes ? `INNER JOIN observations_agg o ON t.id = o.trace_id AND t.project_id = o.project_id` : ""}
-        WHERE ${tracesFilterRes.query}
-        AND t.project_id = {projectId: String}
-        AND t.timestamp >= {timestamp: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}
-        ${maxTimeStamp ? `AND t.timestamp <= {maxTimeStamp: DateTime64(3)}` : ""}
-        ${!maxTimeStamp ? `AND t.timestamp <= {timestamp: DateTime64(3)} + INTERVAL 2 DAY` : ""}
-        ${exactTimestamp ? `AND toDate(t.timestamp) = toDate({exactTimestamp: DateTime64(3)})` : ""}
-        GROUP BY t.id, t.project_id, t.timestamp
-      `;
-
-      const rows = await queryClickhouse<{
-        id: string;
-        project_id: string;
-        timestamp: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
-
-      return {
-        exists: rows.length > 0,
-        timestamp:
-          rows.length > 0
-            ? parseClickhouseUTCDateTimeFormat(rows[0].timestamp)
-            : undefined,
-      };
-    },
-  });
+  return { exists: !!row, timestamp: row?.timestamp };
 };
 
 /**
@@ -195,66 +208,71 @@ export const upsertTrace = async (trace: Partial<TraceRecordReadType>) => {
     throw new Error("Identifier fields must be provided to upsert Trace.");
   }
 
-  await upsertClickhouse({
-    table: "traces",
-    records: [trace as TraceRecordReadType],
-    eventBodyMapper: convertClickhouseToDomain,
-    tags: {
-      feature: "tracing",
-      type: "trace",
-      kind: "upsert",
-      projectId: trace.project_id ?? "",
-    },
-  });
+  const timestamp = parseDateInput(trace.timestamp);
+
+  const createdAt = trace.created_at
+    ? parseDateInput(trace.created_at)
+    : timestamp;
+  const updatedAt = trace.updated_at
+    ? parseDateInput(trace.updated_at)
+    : timestamp;
+  await prisma.$executeRaw`
+    DELETE FROM traces
+    WHERE project_id = ${trace.project_id as string}
+      AND id = ${trace.id as string}
+  `;
+  await prisma.$executeRaw`
+    INSERT INTO traces (
+      id, project_id, "timestamp", name, user_id, session_id, environment,
+      public, bookmarked, tags, input, output, metadata, release, version,
+      created_at, updated_at, event_ts, is_deleted
+    ) VALUES (
+      ${trace.id as string},
+      ${trace.project_id as string},
+      ${timestamp},
+      ${trace.name ?? null},
+      ${trace.user_id ?? null},
+      ${trace.session_id ?? null},
+      ${trace.environment ?? "default"},
+      ${trace.public ?? false},
+      ${trace.bookmarked ?? false},
+      ${trace.tags ?? []},
+      ${typeof trace.input === "string" ? trace.input : trace.input == null ? null : JSON.stringify(trace.input)},
+      ${typeof trace.output === "string" ? trace.output : trace.output == null ? null : JSON.stringify(trace.output)},
+      ${(trace.metadata ?? {}) as any},
+      ${trace.release ?? null},
+      ${trace.version ?? null},
+      ${createdAt},
+      ${updatedAt},
+      ${updatedAt},
+      ${false}
+    )
+  `;
 };
 
 export const getTracesByIds = async (
   traceIds: string[],
   projectId: string,
   timestamp?: Date,
-  clickhouseConfigs?: ClickHouseClientConfigOptions | undefined,
+  _clickhouseConfigs?: ClickHouseClientConfigOptions | undefined,
 ) => {
-  const records = await measureAndReturn({
-    operationName: "getTracesByIds",
-    projectId,
-    input: {
-      params: {
-        traceIds,
-        projectId,
-        timestamp: timestamp
-          ? convertDateToClickhouseDateTime(timestamp)
-          : null,
-      },
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "byId",
-        projectId,
-        operation_name: "getTracesByIds",
-      },
-      clickhouseConfigs,
-    },
-    fn: (input) => {
-      const query = `
-        SELECT *
-        FROM traces
-        WHERE id IN ({traceIds: Array(String)})
-        AND project_id = {projectId: String}
-        ${timestamp ? `AND timestamp >= {timestamp: DateTime64(3)}` : ""}
-        ORDER BY event_ts DESC
-        LIMIT 1 by id, project_id;
-      `;
-      return queryClickhouse<TraceRecordReadType>({
-        query,
-        params: input.params,
-        tags: input.tags,
-        clickhouseConfigs: input.clickhouseConfigs,
-      });
-    },
-  });
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`project_id = ${projectId}`,
+    Prisma.sql`id IN (${Prisma.join(traceIds)})`,
+  ];
+  if (timestamp) conditions.push(Prisma.sql`timestamp >= ${timestamp}`);
+  const records = await prisma.$queryRaw<PgTraceRow[]>(Prisma.sql`
+    SELECT *
+    FROM traces
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY updated_at DESC
+  `);
 
   return records.map((record) =>
-    convertClickhouseToDomain(record, DEFAULT_RENDERING_PROPS),
+    convertClickhouseToDomain(
+      toTraceRecordReadType(record),
+      DEFAULT_RENDERING_PROPS,
+    ),
   );
 };
 
@@ -263,6 +281,8 @@ export const getTracesBySessionId = async (
   sessionIds: string[],
   timestamp?: Date,
 ) => {
+  if (sessionIds.length === 0) return [];
+
   const records = await measureAndReturn({
     operationName: "getTracesBySessionId",
     projectId,
@@ -283,21 +303,16 @@ export const getTracesBySessionId = async (
       },
       timestamp,
     },
-    fn: (input) => {
-      const query = `
-        SELECT *
+    fn: async () => {
+      const rows = await prisma.$queryRaw<PgTraceRow[]>(Prisma.sql`
+        SELECT DISTINCT ON (id, project_id) *
         FROM traces
-        WHERE session_id IN ({sessionIds: Array(String)})
-        AND project_id = {projectId: String}
-        ${timestamp ? `AND timestamp >= {timestamp: DateTime64(3)}` : ""}
-        ORDER BY event_ts DESC
-        LIMIT 1 by id, project_id;
-      `;
-      return queryClickhouse<TraceRecordReadType>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+        WHERE session_id IN (${Prisma.join(sessionIds)})
+          AND project_id = ${projectId}
+          ${timestamp ? Prisma.sql`AND timestamp >= ${timestamp}` : Prisma.empty}
+        ORDER BY id, project_id, event_ts DESC
+      `);
+      return rows.map((row) => toTraceRecordReadType(row));
     },
   });
 
@@ -318,7 +333,7 @@ export const getTracesBySessionId = async (
 export const hasAnyTrace = async (projectId: string) => {
   // Check PostgreSQL flag first — once set, it's never reverted
   try {
-    const project = await prisma.project.findUnique({
+    const project = await metadataPrisma.project.findUnique({
       where: { id: projectId },
       select: { hasTraces: true },
     });
@@ -327,62 +342,40 @@ export const hasAnyTrace = async (projectId: string) => {
     }
   } catch (error) {
     traceException(error);
-    logger.error("Failed to read hasTraces flag from PostgreSQL", {
-      projectId,
-      error,
-    });
+    logger.error(
+      `Failed to read hasTraces flag from PostgreSQL; projectId=${projectId}; error=${stringifyErrorForMessage(error)}`,
+    );
   }
 
-  const result = await measureAndReturn({
-    operationName: "hasAnyTrace",
-    projectId,
-    input: {
-      projectId,
-      tags: {
-        feature: "tracing",
-        type: "trace",
-        kind: "hasAny",
-        projectId,
-        operation_name: "hasAnyTrace",
-      },
-    },
-    fn: async (input) => {
-      const query = `
-        SELECT 1
-        FROM traces
-        WHERE project_id = {projectId: String}
-        LIMIT 1
-      `;
-
-      const rows = await queryClickhouse<{ 1: number }>({
-        query,
-        params: {
-          projectId: input.projectId,
-        },
-        tags: input.tags,
-        clickhouseSettings: {
-          max_threads: 1,
-        },
-      });
-
-      return rows.length > 0;
-    },
-  });
+  let result = false;
+  try {
+    result =
+      (
+        await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+          SELECT id FROM traces WHERE project_id = ${projectId} LIMIT 1
+        `)
+      ).length > 0;
+  } catch (error) {
+    traceException(error);
+    logger.error(
+      `Failed to read traces presence from tracing PostgreSQL; projectId=${projectId}; error=${stringifyErrorForMessage(error)}`,
+    );
+    throw error;
+  }
 
   // Persist positive result in PostgreSQL — once a project has traces, it stays true
   // Only update if not already set to avoid unnecessary writes
   if (result) {
     try {
-      await prisma.project.updateMany({
+      await metadataPrisma.project.updateMany({
         where: { id: projectId, hasTraces: false },
         data: { hasTraces: true },
       });
     } catch (error) {
       traceException(error);
-      logger.error("Failed to persist hasTraces flag to PostgreSQL", {
-        projectId,
-        error,
-      });
+      logger.error(
+        `Failed to persist hasTraces flag to PostgreSQL; projectId=${projectId}; error=${stringifyErrorForMessage(error)}`,
+      );
     }
   }
 
@@ -412,24 +405,16 @@ export const getTraceCountsByProjectInCreationInterval = async ({
       },
       timestamp: start,
     },
-    fn: async (input) => {
-      const query = `
-        SELECT
-          project_id,
-          count(*) as count
+    fn: async () => {
+      const rows = await prisma.$queryRaw<
+        Array<{ project_id: string; count: bigint }>
+      >(Prisma.sql`
+        SELECT project_id, count(*)::bigint as count
         FROM traces
-        WHERE created_at >= {start: DateTime64(3)}
-        AND created_at < {end: DateTime64(3)}
+        WHERE created_at >= ${start}
+          AND created_at < ${end}
         GROUP BY project_id
-      `;
-
-      const rows = await queryClickhouse<{ project_id: string; count: string }>(
-        {
-          query,
-          params: input.params,
-          tags: input.tags,
-        },
-      );
+      `);
 
       return rows.map((row) => ({
         projectId: row.project_id,
@@ -446,6 +431,8 @@ export const getTraceCountOfProjectsSinceCreationDate = async ({
   projectIds: string[];
   start: Date;
 }) => {
+  if (projectIds.length === 0) return 0;
+
   return measureAndReturn({
     operationName: "getTraceCountOfProjectsSinceCreationDate",
     projectId: "__CROSS_PROJECT__",
@@ -462,22 +449,14 @@ export const getTraceCountOfProjectsSinceCreationDate = async ({
       },
       timestamp: start,
     },
-    fn: async (input) => {
-      const query = `
-        SELECT
-          count(*) as count
+    fn: async () => {
+      const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+        SELECT count(*)::bigint as count
         FROM traces
-        WHERE project_id IN ({projectIds: Array(String)})
-        AND created_at >= {start: DateTime64(3)}
-      `;
-
-      const rows = await queryClickhouse<{ count: string }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
-
-      return Number(rows[0]?.count ?? 0);
+        WHERE project_id IN (${Prisma.join(projectIds)})
+          AND created_at >= ${start}
+      `);
+      return Number(rows[0]?.count ?? 0n);
     },
   });
 };
@@ -495,8 +474,8 @@ export const getTraceById = async ({
   timestamp,
   fromTimestamp,
   renderingProps = DEFAULT_RENDERING_PROPS,
-  clickhouseFeatureTag = "tracing",
-  preferredClickhouseService,
+  clickhouseFeatureTag: _clickhouseFeatureTag = "tracing",
+  preferredClickhouseService: _preferredClickhouseService,
   excludeInputOutput = false,
 }: {
   traceId: string;
@@ -509,81 +488,61 @@ export const getTraceById = async ({
   /** When true, sets input/output columns to empty in the query to reduce database load */
   excludeInputOutput?: boolean;
 }) => {
-  const records = await measureAndReturn({
-    operationName: "getTraceById",
-    projectId,
-    input: {
-      params: {
-        traceId,
-        projectId,
-        ...(timestamp
-          ? { timestamp: convertDateToClickhouseDateTime(timestamp) }
-          : {}),
-        ...(fromTimestamp
-          ? { fromTimestamp: convertDateToClickhouseDateTime(fromTimestamp) }
-          : {}),
-      },
-      tags: {
-        feature: clickhouseFeatureTag,
-        type: "trace",
-        kind: "byId",
-        projectId,
-        operation_name: "getTraceById",
-      },
-    },
-    fn: (input) => {
-      const inputColumn = excludeInputOutput
-        ? "''"
-        : renderingProps.truncated
-          ? `leftUTF8(input, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`
-          : "input";
-      const outputColumn = excludeInputOutput
-        ? "''"
-        : renderingProps.truncated
-          ? `leftUTF8(output, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`
-          : "output";
+  const timestampWhere: { gte?: Date; lt?: Date } = {};
+  if (timestamp) {
+    timestampWhere.gte = new Date(
+      Date.UTC(
+        timestamp.getUTCFullYear(),
+        timestamp.getUTCMonth(),
+        timestamp.getUTCDate(),
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+    timestampWhere.lt = new Date(
+      Date.UTC(
+        timestamp.getUTCFullYear(),
+        timestamp.getUTCMonth(),
+        timestamp.getUTCDate() + 1,
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
+  }
+  if (fromTimestamp) {
+    timestampWhere.gte = fromTimestamp;
+  }
 
-      const query = `
-        SELECT
-          id,
-          name as name,
-          user_id as user_id,
-          metadata as metadata,
-          release as release,
-          version as version,
-          project_id,
-          environment,
-          public as public,
-          bookmarked as bookmarked,
-          tags,
-          ${inputColumn} as input,
-          ${outputColumn} as output,
-          session_id as session_id,
-          0 as is_deleted,
-          timestamp,
-          created_at,
-          updated_at
-        FROM traces
-        WHERE id = {traceId: String}
-        AND project_id = {projectId: String}
-        ${timestamp ? `AND toDate(timestamp) = toDate({timestamp: DateTime64(3)})` : ""}
-        ${fromTimestamp ? `AND timestamp >= {fromTimestamp: DateTime64(3)}` : ""}
-        ORDER BY event_ts DESC
-        LIMIT 1
-      `;
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`id = ${traceId}`,
+    Prisma.sql`project_id = ${projectId}`,
+  ];
+  if (timestampWhere.gte)
+    conditions.push(Prisma.sql`timestamp >= ${timestampWhere.gte}`);
+  if (timestampWhere.lt)
+    conditions.push(Prisma.sql`timestamp < ${timestampWhere.lt}`);
+  const records = await prisma.$queryRaw<PgTraceRow[]>(Prisma.sql`
+    SELECT *
+    FROM traces
+    WHERE ${Prisma.join(conditions, " AND ")}
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `);
+  const record = records[0];
 
-      return queryClickhouse<TraceRecordReadType>({
-        query,
-        params: input.params,
-        tags: input.tags,
-        preferredClickhouseService,
-      });
-    },
-  });
+  if (!record) return undefined;
 
-  const res = records.map((record) =>
-    convertClickhouseToDomain(record, renderingProps),
-  );
+  const mapped = toTraceRecordReadType(record);
+  if (excludeInputOutput) {
+    mapped.input = "";
+    mapped.output = "";
+  }
+
+  const res = [convertClickhouseToDomain(mapped, renderingProps)];
 
   res.forEach((trace) => {
     recordDistribution(
@@ -600,25 +559,14 @@ export const getTraceById = async ({
 
 export const getTracesGroupedByName = async (
   projectId: string,
-  tableDefinitions: UiColumnMappings = tracesTableUiColumnDefinitions,
+  _tableDefinitions: UiColumnMappings = tracesTableUiColumnDefinitions,
   timestampFilter?: FilterState,
 ) => {
-  const chFilter = timestampFilter
-    ? createFilterFromFilterState(timestampFilter, tableDefinitions)
-    : undefined;
-
-  const timestampFilterRes = chFilter
-    ? new FilterList(chFilter).apply()
-    : undefined;
-
   return measureAndReturn({
     operationName: "getTracesGroupedByName",
     projectId,
     input: {
-      params: {
-        projectId,
-        ...(timestampFilterRes ? timestampFilterRes.params : {}),
-      },
+      params: { projectId },
       tags: {
         feature: "tracing",
         type: "trace",
@@ -627,30 +575,37 @@ export const getTracesGroupedByName = async (
         operation_name: "getTracesGroupedByName",
       },
     },
-    fn: async (input) => {
-      // We mainly use queries like this to retrieve filter options.
-      // Therefore, we can skip final as some inaccuracy in count is acceptable.
-      const query = `
-        select
-          name as name,
-          count(*) as count
-        from traces t
-        WHERE t.project_id = {projectId: String}
-        AND t.name IS NOT NULL
-        ${timestampFilterRes?.query ? `AND ${timestampFilterRes.query}` : ""}
-        GROUP BY name
-        ORDER BY count(*) desc
-        LIMIT 1000;
-      `;
-
-      return queryClickhouse<{
-        name: string;
-        count: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+    fn: async () => {
+      const timestampFilters = (timestampFilter ?? []).filter(
+        (f) => f.column === "timestamp" && f.type === "datetime",
+      ) as Array<{ operator: string; value: Date }>;
+      const conditions: Prisma.Sql[] = [
+        Prisma.sql`project_id = ${projectId}`,
+        Prisma.sql`name IS NOT NULL`,
+      ];
+      for (const tf of timestampFilters) {
+        if (tf.operator === ">=")
+          conditions.push(Prisma.sql`timestamp >= ${tf.value}`);
+        if (tf.operator === ">")
+          conditions.push(Prisma.sql`timestamp > ${tf.value}`);
+        if (tf.operator === "<=")
+          conditions.push(Prisma.sql`timestamp <= ${tf.value}`);
+        if (tf.operator === "<")
+          conditions.push(Prisma.sql`timestamp < ${tf.value}`);
+      }
+      const rows = await prisma.$queryRaw<
+        Array<{ name: string; count: bigint }>
+      >(
+        Prisma.sql`
+          SELECT name, COUNT(*)::bigint AS count
+          FROM traces
+          WHERE ${Prisma.join(conditions, " AND ")}
+          GROUP BY name
+          ORDER BY COUNT(*) DESC
+          LIMIT 1000
+        `,
+      );
+      return rows.map((r) => ({ name: r.name, count: String(r.count) }));
     },
   });
 };
@@ -661,33 +616,13 @@ export const getTracesGroupedBySessionId = async (
   searchQuery?: string,
   limit?: number,
   offset?: number,
-  columns?: UiColumnMappings,
+  _columns?: UiColumnMappings,
 ) => {
-  const { tracesFilter } = getProjectIdDefaultFilter(projectId, {
-    tracesPrefix: "t",
-  });
-
-  tracesFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      columns ?? tracesTableUiColumnDefinitions,
-    ),
-  );
-
-  const tracesFilterRes = tracesFilter.apply();
-  const search = clickhouseSearchCondition(searchQuery, undefined, "t");
-
   return measureAndReturn({
     operationName: "getTracesGroupedBySessionId",
     projectId,
     input: {
-      params: {
-        limit,
-        offset,
-        projectId,
-        ...(tracesFilterRes ? tracesFilterRes.params : {}),
-        ...(searchQuery ? search.params : {}),
-      },
+      params: { projectId, limit, offset },
       tags: {
         feature: "tracing",
         type: "trace",
@@ -696,32 +631,43 @@ export const getTracesGroupedBySessionId = async (
         operation_name: "getTracesGroupedBySessionId",
       },
     },
-    fn: async (input) => {
-      // We mainly use queries like this to retrieve filter options.
-      // Therefore, we can skip final as some inaccuracy in count is acceptable.
-      const query = `
-        select
-          session_id as session_id,
-          count(*) as count
-        from traces t
-        WHERE t.project_id = {projectId: String}
-        AND t.session_id IS NOT NULL
-        AND t.session_id != ''
-        ${tracesFilterRes?.query ? `AND ${tracesFilterRes.query}` : ""}
-        ${search.query}
+    fn: async () => {
+      const timestampFilters = (filter ?? []).filter(
+        (f) => f.column === "timestamp" && f.type === "datetime",
+      ) as Array<{ operator: string; value: Date }>;
+      const conditions: Prisma.Sql[] = [
+        Prisma.sql`project_id = ${projectId}`,
+        Prisma.sql`session_id IS NOT NULL`,
+        Prisma.sql`session_id != ''`,
+      ];
+      for (const tf of timestampFilters) {
+        if (tf.operator === ">=")
+          conditions.push(Prisma.sql`timestamp >= ${tf.value}`);
+        if (tf.operator === ">")
+          conditions.push(Prisma.sql`timestamp > ${tf.value}`);
+        if (tf.operator === "<=")
+          conditions.push(Prisma.sql`timestamp <= ${tf.value}`);
+        if (tf.operator === "<")
+          conditions.push(Prisma.sql`timestamp < ${tf.value}`);
+      }
+      if (searchQuery) {
+        conditions.push(Prisma.sql`session_id ILIKE ${`%${searchQuery}%`}`);
+      }
+      const rows = await prisma.$queryRaw<
+        Array<{ session_id: string; count: bigint }>
+      >(Prisma.sql`
+        SELECT session_id, COUNT(*)::bigint AS count
+        FROM traces
+        WHERE ${Prisma.join(conditions, " AND ")}
         GROUP BY session_id
-        ORDER BY count desc
-        ${limit !== undefined && offset !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
-      `;
-
-      return queryClickhouse<{
-        session_id: string;
-        count: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+        ORDER BY count DESC
+        ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+        ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+      `);
+      return rows.map((r) => ({
+        session_id: r.session_id,
+        count: String(r.count),
+      }));
     },
   });
 };
@@ -732,33 +678,13 @@ export const getTracesGroupedByUsers = async (
   searchQuery?: string,
   limit?: number,
   offset?: number,
-  columns?: UiColumnMappings,
+  _columns?: UiColumnMappings,
 ) => {
-  const { tracesFilter } = getProjectIdDefaultFilter(projectId, {
-    tracesPrefix: "t",
-  });
-
-  tracesFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      columns ?? tracesTableUiColumnDefinitions,
-    ),
-  );
-
-  const tracesFilterRes = tracesFilter.apply();
-  const search = clickhouseSearchCondition(searchQuery, undefined, "t");
-
   return measureAndReturn({
     operationName: "getTracesGroupedByUsers",
     projectId,
     input: {
-      params: {
-        limit,
-        offset,
-        projectId,
-        ...(tracesFilterRes ? tracesFilterRes.params : {}),
-        ...(searchQuery ? search.params : {}),
-      },
+      params: { projectId, limit, offset },
       tags: {
         feature: "tracing",
         type: "trace",
@@ -767,32 +693,42 @@ export const getTracesGroupedByUsers = async (
         operation_name: "getTracesGroupedByUsers",
       },
     },
-    fn: async (input) => {
-      // We mainly use queries like this to retrieve filter options.
-      // Therefore, we can skip final as some inaccuracy in count is acceptable.
-      const query = `
-        select
-          user_id as user,
-          count(*) as count
-        from traces t
-        WHERE t.project_id = {projectId: String}
-        AND t.user_id IS NOT NULL
-        AND t.user_id != ''
-        ${tracesFilterRes?.query ? `AND ${tracesFilterRes.query}` : ""}
-        ${search.query}
-        GROUP BY user
-        ORDER BY count desc
-        ${limit !== undefined && offset !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
-      `;
-
-      return queryClickhouse<{
-        user: string;
-        count: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+    fn: async () => {
+      const timestampFilters = (filter ?? []).filter(
+        (f) => f.column === "timestamp" && f.type === "datetime",
+      ) as Array<{ operator: string; value: Date }>;
+      const conditions: Prisma.Sql[] = [
+        Prisma.sql`project_id = ${projectId}`,
+        Prisma.sql`user_id IS NOT NULL`,
+        Prisma.sql`user_id != ''`,
+      ];
+      for (const tf of timestampFilters) {
+        if (tf.operator === ">=")
+          conditions.push(Prisma.sql`timestamp >= ${tf.value}`);
+        if (tf.operator === ">")
+          conditions.push(Prisma.sql`timestamp > ${tf.value}`);
+        if (tf.operator === "<=")
+          conditions.push(Prisma.sql`timestamp <= ${tf.value}`);
+        if (tf.operator === "<")
+          conditions.push(Prisma.sql`timestamp < ${tf.value}`);
+      }
+      if (searchQuery) {
+        conditions.push(Prisma.sql`user_id ILIKE ${`%${searchQuery}%`}`);
+      }
+      const rows = await prisma.$queryRaw<
+        Array<{ user: string; count: bigint }>
+      >(
+        Prisma.sql`
+          SELECT user_id AS user, COUNT(*)::bigint AS count
+          FROM traces
+          WHERE ${Prisma.join(conditions, " AND ")}
+          GROUP BY user_id
+          ORDER BY count DESC
+          ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+          ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+        `,
+      );
+      return rows.map((r) => ({ user: r.user, count: String(r.count) }));
     },
   });
 };
@@ -804,23 +740,13 @@ export type GroupedTracesQueryProp = {
 };
 
 export const getTracesGroupedByTags = async (props: GroupedTracesQueryProp) => {
-  const { projectId, filter, columns } = props;
-
-  const chFilter = createFilterFromFilterState(
-    filter,
-    columns ?? tracesTableUiColumnDefinitions,
-  );
-
-  const filterRes = new FilterList(chFilter).apply();
+  const { projectId, filter } = props;
 
   return measureAndReturn({
     operationName: "getTracesGroupedByTags",
     projectId,
     input: {
-      params: {
-        projectId,
-        ...(filterRes ? filterRes.params : {}),
-      },
+      params: { projectId },
       tags: {
         feature: "tracing",
         type: "trace",
@@ -829,22 +755,31 @@ export const getTracesGroupedByTags = async (props: GroupedTracesQueryProp) => {
         operation_name: "getTracesGroupedByTags",
       },
     },
-    fn: async (input) => {
-      const query = `
-        select distinct(arrayJoin(tags)) as value
-        from traces t
-        WHERE t.project_id = {projectId: String}
-        ${filterRes?.query ? `AND ${filterRes.query}` : ""}
-        LIMIT 1000;
-      `;
-
-      return queryClickhouse<{
-        value: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+    fn: async () => {
+      const timestampFilters = (filter ?? []).filter(
+        (f) => f.column === "timestamp" && f.type === "datetime",
+      ) as Array<{ operator: string; value: Date }>;
+      const conditions: Prisma.Sql[] = [
+        Prisma.sql`t.project_id = ${projectId}`,
+      ];
+      for (const tf of timestampFilters) {
+        if (tf.operator === ">=")
+          conditions.push(Prisma.sql`t.timestamp >= ${tf.value}`);
+        if (tf.operator === ">")
+          conditions.push(Prisma.sql`t.timestamp > ${tf.value}`);
+        if (tf.operator === "<=")
+          conditions.push(Prisma.sql`t.timestamp <= ${tf.value}`);
+        if (tf.operator === "<")
+          conditions.push(Prisma.sql`t.timestamp < ${tf.value}`);
+      }
+      const rows = await prisma.$queryRaw<Array<{ value: string }>>(Prisma.sql`
+        SELECT DISTINCT tag.value
+        FROM traces t
+        CROSS JOIN LATERAL UNNEST(t.tags) AS tag(value)
+        WHERE ${Prisma.join(conditions, " AND ")}
+        LIMIT 1000
+      `);
+      return rows;
     },
   });
 };
@@ -869,33 +804,27 @@ export const getTracesIdentifierForSession = async (
         operation_name: "getTracesIdentifierForSession",
       },
     },
-    fn: (input) => {
-      const query = `
-        SELECT
+    fn: async () => {
+      return prisma.$queryRaw<
+        Array<{
+          id: string;
+          user_id: string;
+          name: string;
+          timestamp: Date;
+          environment: string;
+        }>
+      >(Prisma.sql`
+        SELECT DISTINCT ON (id, project_id)
           id,
           user_id,
           name,
           timestamp,
-          project_id,
           environment
         FROM traces
-        WHERE (project_id = {projectId: String})
-        AND (session_id = {sessionId: String})
-        ORDER BY timestamp ASC
-        LIMIT 1 BY id, project_id;
-      `;
-
-      return queryClickhouse<{
-        id: string;
-        user_id: string;
-        name: string;
-        timestamp: string;
-        environment: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+        WHERE project_id = ${projectId}
+          AND session_id = ${sessionId}
+        ORDER BY id, project_id, timestamp ASC
+      `);
     },
   });
 
@@ -903,7 +832,10 @@ export const getTracesIdentifierForSession = async (
     id: row.id,
     userId: row.user_id,
     name: row.name,
-    timestamp: parseClickhouseUTCDateTimeFormat(row.timestamp),
+    timestamp:
+      row.timestamp instanceof Date
+        ? row.timestamp
+        : parseClickhouseUTCDateTimeFormat(row.timestamp),
     environment: row.environment,
   }));
 };
@@ -924,29 +856,20 @@ export const deleteTraces = async (projectId: string, traceIds: string[]) => {
         projectId,
       },
     },
-    fn: async (input) => {
-      // Pre-flight query with time bounds computed
-      const preflight = await queryClickhouse<{
-        min_ts: string;
-        max_ts: string;
-        cnt: string;
-      }>({
-        query: `
-          SELECT
-            min(timestamp) - INTERVAL 1 HOUR as min_ts,
-            max(timestamp) + INTERVAL 1 HOUR as max_ts,
-            count(*) as cnt
-          FROM traces
-          WHERE project_id = {projectId: String} AND id IN ({traceIds: Array(String)})
-        `,
-        params: input.params,
-        clickhouseConfigs: {
-          request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-        },
-        tags: { ...input.tags, kind: "delete-preflight" },
-      });
+    fn: async () => {
+      const preflight = await prisma.$queryRaw<
+        Array<{ min_ts: Date | null; max_ts: Date | null; cnt: bigint }>
+      >(Prisma.sql`
+        SELECT
+          (min(timestamp) - INTERVAL '1 hour') as min_ts,
+          (max(timestamp) + INTERVAL '1 hour') as max_ts,
+          count(*)::bigint as cnt
+        FROM traces
+        WHERE project_id = ${projectId}
+          AND id IN (${Prisma.join(traceIds)})
+      `);
 
-      const count = Number(preflight[0]?.cnt ?? 0);
+      const count = Number(preflight[0]?.cnt ?? 0n);
       if (count === 0) {
         logger.info(
           `deleteTraces: no rows found for project ${projectId}, skipping DELETE`,
@@ -954,24 +877,13 @@ export const deleteTraces = async (projectId: string, traceIds: string[]) => {
         return;
       }
 
-      await commandClickhouse({
-        query: `
-          DELETE FROM traces
-          WHERE project_id = {projectId: String}
-          AND id IN ({traceIds: Array(String)})
-          AND timestamp >= {minTs: String}::DateTime64(3)
-          AND timestamp <= {maxTs: String}::DateTime64(3)
-        `,
-        params: {
-          ...input.params,
-          minTs: preflight[0].min_ts,
-          maxTs: preflight[0].max_ts,
-        },
-        clickhouseConfigs: {
-          request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-        },
-        tags: input.tags,
-      });
+      await prisma.$executeRaw`
+        DELETE FROM traces
+        WHERE project_id = ${projectId}
+          AND id IN (${Prisma.join(traceIds)})
+          AND timestamp >= ${preflight[0].min_ts}
+          AND timestamp <= ${preflight[0].max_ts}
+      `;
     },
   });
 };
@@ -980,27 +892,13 @@ export const hasAnyTraceOlderThan = async (
   projectId: string,
   beforeDate: Date,
 ) => {
-  const query = `
-    SELECT 1
+  const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+    SELECT 1 as one
     FROM traces
-    WHERE project_id = {projectId: String}
-    AND timestamp < {cutoffDate: DateTime64(3)}
+    WHERE project_id = ${projectId}
+      AND timestamp < ${beforeDate}
     LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<{ 1: number }>({
-    query,
-    params: {
-      projectId,
-      cutoffDate: convertDateToClickhouseDateTime(beforeDate),
-    },
-    tags: {
-      feature: "tracing",
-      type: "trace",
-      kind: "hasAnyOlderThan",
-      projectId,
-    },
-  });
+  `);
 
   return rows.length > 0;
 };
@@ -1029,20 +927,12 @@ export const deleteTracesOlderThanDays = async (
         projectId,
       },
     },
-    fn: async (input) => {
-      const query = `
+    fn: async () => {
+      await prisma.$executeRaw`
         DELETE FROM traces
-        WHERE project_id = {projectId: String}
-        AND timestamp < {cutoffDate: DateTime64(3)};
+        WHERE project_id = ${projectId}
+          AND timestamp < ${beforeDate}
       `;
-      await commandClickhouse({
-        query: query,
-        params: input.params,
-        clickhouseConfigs: {
-          request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-        },
-        tags: input.tags,
-      });
     },
   });
 
@@ -1071,20 +961,11 @@ export const deleteTracesByProjectId = async (
         projectId,
       },
     },
-    fn: async (input) => {
-      const query = `
+    fn: async () => {
+      await prisma.$executeRaw`
         DELETE FROM traces
-        WHERE project_id = {projectId: String};
+        WHERE project_id = ${projectId}
       `;
-
-      await commandClickhouse({
-        query,
-        params: input.params,
-        clickhouseConfigs: {
-          request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-        },
-        tags: input.tags,
-      });
     },
   });
 
@@ -1106,22 +987,14 @@ export const hasAnyUser = async (projectId: string) => {
       },
     },
     fn: async (input) => {
-      const query = `
-        SELECT 1
+      const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+        SELECT 1 as one
         FROM traces
-        WHERE project_id = {projectId: String}
-        AND user_id IS NOT NULL
-        AND user_id != ''
+        WHERE project_id = ${input.projectId}
+          AND user_id IS NOT NULL
+          AND user_id != ''
         LIMIT 1
-      `;
-
-      const rows = await queryClickhouse<{ 1: number }>({
-        query,
-        params: {
-          projectId: input.projectId,
-        },
-        tags: input.tags,
-      });
+      `);
 
       return rows.length > 0;
     },
@@ -1133,25 +1006,11 @@ export const getTotalUserCount = async (
   filter: FilterState,
   searchQuery?: string,
 ): Promise<{ totalCount: bigint }[]> => {
-  const { tracesFilter } = getProjectIdDefaultFilter(projectId, {
-    tracesPrefix: "t",
-  });
-
-  tracesFilter.push(
-    ...createFilterFromFilterState(filter, tracesTableUiColumnDefinitions),
-  );
-
-  const tracesFilterRes = tracesFilter.apply();
-  const search = clickhouseSearchCondition(searchQuery, undefined, "t");
-
   return measureAndReturn({
     operationName: "getTotalUserCount",
     projectId,
     input: {
-      params: {
-        ...tracesFilterRes.params,
-        ...search.params,
-      },
+      params: {},
       tags: {
         feature: "tracing",
         type: "trace",
@@ -1160,21 +1019,33 @@ export const getTotalUserCount = async (
         operation_name: "getTotalUserCount",
       },
     },
-    fn: async (input) => {
-      const query = `
-        SELECT COUNT(DISTINCT t.user_id) AS totalCount
-        FROM traces t
-        WHERE ${tracesFilterRes.query}
-        ${search.query}
-        AND t.user_id IS NOT NULL
-        AND t.user_id != ''
-      `;
+    fn: async () => {
+      const timestampConditions = filter
+        .filter(
+          (f) =>
+            f.type === "datetime" &&
+            (f.column === "timestamp" || f.column === "Timestamp"),
+        )
+        .map((f) => {
+          if (f.operator === ">=") return Prisma.sql`t.timestamp >= ${f.value}`;
+          if (f.operator === ">") return Prisma.sql`t.timestamp > ${f.value}`;
+          if (f.operator === "<=") return Prisma.sql`t.timestamp <= ${f.value}`;
+          return Prisma.sql`t.timestamp < ${f.value}`;
+        });
 
-      return queryClickhouse({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+      const userSearch = searchQuery?.trim()
+        ? Prisma.sql`AND t.user_id ILIKE ${`%${searchQuery.trim()}%`}`
+        : Prisma.empty;
+
+      return prisma.$queryRaw<Array<{ totalCount: bigint }>>(Prisma.sql`
+        SELECT COUNT(DISTINCT t.user_id)::bigint AS "totalCount"
+        FROM traces t
+        WHERE t.project_id = ${projectId}
+          AND t.user_id IS NOT NULL
+          AND t.user_id != ''
+          ${timestampConditions.length ? Prisma.sql`AND ${Prisma.join(timestampConditions, " AND ")}` : Prisma.empty}
+          ${userSearch}
+      `);
     },
   });
 };
@@ -1184,107 +1055,13 @@ export const getUserMetrics = async (
   userIds: string[],
   filter: FilterState,
 ) => {
-  if (userIds.length === 0) {
-    return [];
-  }
-
-  // filter state contains date range filter for traces so far.
-  const chFilter = new FilterList(
-    createFilterFromFilterState(filter, tracesTableUiColumnDefinitions),
-  );
-  const chFilterRes = chFilter.apply();
-
-  const timestampFilter = chFilter.find(
-    (f) => f.field === "timestamp" && f.operator === ">=",
-  );
-
-  // this query uses window functions on observations + traces to always get only the first row and thereby remove deduplicates
-  // we filter wherever possible by project id and user id
-  const query = `
-      WITH stats as (
-        SELECT
-            t.user_id as user_id,
-            anyLast(t.environment) as environment,
-            count(distinct o.id) as obs_count,
-            sumMap(usage_details) as sum_usage_details,
-            sum(total_cost) as sum_total_cost,
-            max(t.timestamp) as max_timestamp,
-            min(t.timestamp) as min_timestamp,
-            count(distinct t.id) as trace_count
-        FROM
-            (
-                SELECT
-                    o.project_id,
-                    o.trace_id,
-                    o.usage_details,
-                    o.total_cost,
-                    id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY id
-                        ORDER BY
-                            event_ts DESC
-                    ) AS rn
-                FROM
-                    observations o
-                WHERE
-                    o.project_id = {projectId: String }
-                    ${timestampFilter ? `AND o.start_time >= {traceTimestamp: DateTime64(3)} - ${OBSERVATIONS_TO_TRACE_INTERVAL}` : ""}
-                    AND o.trace_id in (
-                        SELECT distinct id
-                        from __TRACE_TABLE__ t
-                        where
-                            user_id IN ({userIds: Array(String) })
-                            AND project_id = {projectId: String }
-                            ${filter.length > 0 ? `AND ${chFilterRes.query}` : ""}
-                    )
-            ) as o
-            JOIN (
-                SELECT
-                    t.id,
-                    t.user_id,
-                    t.project_id,
-                    t.timestamp,
-                    t.environment
-                FROM
-                    __TRACE_TABLE__ t FINAL
-                WHERE
-                    t.user_id IN ({userIds: Array(String) })
-                    AND t.project_id = {projectId: String }
-                    ${filter.length > 0 ? `AND ${chFilterRes.query}` : ""}
-            ) as t on t.id = o.trace_id
-            and t.project_id = o.project_id
-        WHERE o.rn = 1
-        group by t.user_id
-    )
-    SELECT
-        arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, sum_usage_details))) as input_usage,
-        arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, sum_usage_details))) as output_usage,
-        sum_usage_details [ 'total' ] as total_usage,
-        obs_count,
-        trace_count,
-        user_id,
-        environment,
-        sum_total_cost,
-        max_timestamp,
-        min_timestamp
-    FROM stats`;
+  if (userIds.length === 0) return [];
 
   return measureAndReturn({
     operationName: "getUserMetrics",
     projectId,
     input: {
-      params: {
-        projectId,
-        userIds,
-        ...chFilterRes.params,
-        ...(timestampFilter
-          ? {
-              traceTimestamp: convertDateToClickhouseDateTime(
-                (timestampFilter as DateTimeFilter).value,
-              ),
-            }
-          : {}),
-      },
+      params: {},
       tags: {
         feature: "tracing",
         type: "trace",
@@ -1293,29 +1070,80 @@ export const getUserMetrics = async (
         operation_name: "getUserMetrics",
       },
     },
-    fn: async (input) => {
-      const rows = await queryClickhouse<{
-        user_id: string;
-        environment: string;
-        max_timestamp: string;
-        min_timestamp: string;
-        input_usage: string;
-        output_usage: string;
-        total_usage: string;
-        obs_count: string;
-        trace_count: string;
-        sum_total_cost: string;
-      }>({
-        query: query.replaceAll("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: input.tags,
-      });
+    fn: async () => {
+      const traceTimestampConditions = filter
+        .filter(
+          (f) =>
+            f.type === "datetime" &&
+            (f.column === "timestamp" || f.column === "Timestamp"),
+        )
+        .map((f) => {
+          if (f.operator === ">=") return Prisma.sql`t.timestamp >= ${f.value}`;
+          if (f.operator === ">") return Prisma.sql`t.timestamp > ${f.value}`;
+          if (f.operator === "<=") return Prisma.sql`t.timestamp <= ${f.value}`;
+          return Prisma.sql`t.timestamp < ${f.value}`;
+        });
+
+      const fromTimestamp = filter.find(
+        (f) =>
+          f.type === "datetime" &&
+          (f.column === "timestamp" || f.column === "Timestamp") &&
+          (f.operator === ">=" || f.operator === ">"),
+      )?.value;
+      const observationLowerBound =
+        fromTimestamp instanceof Date
+          ? new Date(fromTimestamp.getTime() - 2 * 24 * 60 * 60 * 1000)
+          : null;
+
+      const rows = await prisma.$queryRaw<
+        Array<{
+          user_id: string;
+          environment: string | null;
+          max_timestamp: Date;
+          min_timestamp: Date;
+          input_usage: string;
+          output_usage: string;
+          total_usage: string;
+          obs_count: bigint;
+          trace_count: bigint;
+          sum_total_cost: string;
+        }>
+      >(Prisma.sql`
+        SELECT
+          t.user_id,
+          MAX(t.environment) AS environment,
+          MAX(t.timestamp) AS max_timestamp,
+          MIN(t.timestamp) AS min_timestamp,
+          COALESCE(SUM((o.usage_details->>'input')::numeric), 0)::text AS input_usage,
+          COALESCE(SUM((o.usage_details->>'output')::numeric), 0)::text AS output_usage,
+          COALESCE(SUM((o.usage_details->>'total')::numeric), 0)::text AS total_usage,
+          COUNT(DISTINCT o.id)::bigint AS obs_count,
+          COUNT(DISTINCT t.id)::bigint AS trace_count,
+          COALESCE(
+            SUM(
+              COALESCE(
+                o.total_cost,
+                NULLIF(o.cost_details->>'total', '')::numeric
+              )
+            ),
+            0
+          )::text AS sum_total_cost
+        FROM traces t
+        LEFT JOIN observations o
+          ON o.project_id = t.project_id
+         AND o.trace_id = t.id
+         ${observationLowerBound ? Prisma.sql`AND o.start_time >= ${observationLowerBound}` : Prisma.empty}
+        WHERE t.project_id = ${projectId}
+          AND t.user_id IN (${Prisma.join(userIds)})
+          ${traceTimestampConditions.length ? Prisma.sql`AND ${Prisma.join(traceTimestampConditions, " AND ")}` : Prisma.empty}
+        GROUP BY t.user_id
+      `);
 
       return rows.map((row) => ({
         userId: row.user_id,
-        environment: row.environment,
-        maxTimestamp: parseClickhouseUTCDateTimeFormat(row.max_timestamp),
-        minTimestamp: parseClickhouseUTCDateTimeFormat(row.min_timestamp),
+        environment: row.environment ?? "default",
+        maxTimestamp: row.max_timestamp,
+        minTimestamp: row.min_timestamp,
         inputUsage: Number(row.input_usage),
         outputUsage: Number(row.output_usage),
         totalUsage: Number(row.total_usage),
@@ -1332,48 +1160,36 @@ export const getTracesForBlobStorageExport = function (
   minTimestamp: Date,
   maxTimestamp: Date,
 ) {
-  const traceTable = "traces";
+  const iterator = (async function* () {
+    const rows = await prisma.$queryRaw<Record<string, unknown>[]>(Prisma.sql`
+      SELECT
+        id,
+        timestamp,
+        name,
+        environment,
+        project_id,
+        metadata,
+        user_id,
+        session_id,
+        release,
+        version,
+        public as public,
+        bookmarked as bookmarked,
+        tags,
+        input as input,
+        output as output
+      FROM traces
+      WHERE project_id = ${projectId}
+        AND timestamp >= ${minTimestamp}
+        AND timestamp <= ${maxTimestamp}
+      ORDER BY timestamp ASC
+    `);
+    for (const row of rows) {
+      yield row;
+    }
+  })();
 
-  const query = `
-    SELECT
-      id,
-      timestamp,
-      name,
-      environment,
-      project_id,
-      metadata,
-      user_id,
-      session_id,
-      release,
-      version,
-      public as public,
-      bookmarked as bookmarked,
-      tags,
-      input as input,
-      output as output
-    FROM ${traceTable} FINAL
-    WHERE project_id = {projectId: String}
-    AND timestamp >= {minTimestamp: DateTime64(3)}
-    AND timestamp <= {maxTimestamp: DateTime64(3)}
-  `;
-
-  return queryClickhouseStream<Record<string, unknown>>({
-    query,
-    params: {
-      projectId,
-      minTimestamp: convertDateToClickhouseDateTime(minTimestamp),
-      maxTimestamp: convertDateToClickhouseDateTime(maxTimestamp),
-    },
-    tags: {
-      feature: "blobstorage",
-      type: "trace",
-      kind: "analytic",
-      projectId,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DATA_EXPORT_REQUEST_TIMEOUT_MS,
-    },
-  });
+  return iterator;
 };
 
 export const getTracesForAnalyticsIntegrations = async function* (
@@ -1382,22 +1198,27 @@ export const getTracesForAnalyticsIntegrations = async function* (
   minTimestamp: Date,
   maxTimestamp: Date,
 ) {
-  // Determine which trace table to use based on experiment flag
-  const traceTable = "traces";
-
-  const query = `
+  const records = await prisma.$queryRaw<Record<string, unknown>[]>(Prisma.sql`
     WITH observations_agg AS (
-      SELECT o.project_id,
-             o.trace_id,
-             sum(total_cost) as total_cost,
-             count(*) as observation_count,
-             date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds
-      FROM observations o FINAL
-      WHERE o.project_id = {projectId: String}
-      AND o.start_time >= {minTimestamp: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}
+      SELECT
+        o.project_id,
+        o.trace_id,
+        COALESCE(
+          SUM(
+            COALESCE(
+              o.total_cost,
+              NULLIF(o.cost_details->>'total', '')::numeric
+            )
+          ),
+          0
+        ) as total_cost,
+        count(*)::bigint as observation_count,
+        (EXTRACT(EPOCH FROM (MAX(COALESCE(o.end_time, o.start_time)) - MIN(o.start_time))) * 1000) as latency_milliseconds
+      FROM observations o
+      WHERE o.project_id = ${projectId}
+        AND o.start_time >= ${new Date(minTimestamp.getTime() - 2 * 24 * 60 * 60 * 1000)}
       GROUP BY o.project_id, o.trace_id
     )
-
     SELECT
       t.id as id,
       t.timestamp as timestamp,
@@ -1408,43 +1229,21 @@ export const getTracesForAnalyticsIntegrations = async function* (
       t.version as version,
       t.tags as tags,
       t.environment as environment,
-      t.metadata['$posthog_session_id'] as posthog_session_id,
-      t.metadata['$mixpanel_session_id'] as mixpanel_session_id,
+      t.metadata->>'$posthog_session_id' as posthog_session_id,
+      t.metadata->>'$mixpanel_session_id' as mixpanel_session_id,
       o.total_cost as total_cost,
-      o.latency_milliseconds / 1000 as latency,
+      (o.latency_milliseconds / 1000) as latency,
       o.observation_count as observation_count
-    FROM ${traceTable} t FINAL
+    FROM traces t
     LEFT JOIN observations_agg o ON t.id = o.trace_id AND t.project_id = o.project_id
-    WHERE t.project_id = {projectId: String}
-    AND t.timestamp >= {minTimestamp: DateTime64(3)}
-    AND t.timestamp <= {maxTimestamp: DateTime64(3)}
-  `;
-
-  const records = queryClickhouseStream<Record<string, unknown>>({
-    query,
-    params: {
-      projectId,
-      minTimestamp: convertDateToClickhouseDateTime(minTimestamp),
-      maxTimestamp: convertDateToClickhouseDateTime(maxTimestamp),
-    },
-    tags: {
-      feature: "posthog",
-      type: "trace",
-      kind: "analytic",
-      projectId,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DATA_EXPORT_REQUEST_TIMEOUT_MS,
-      clickhouse_settings: {
-        join_algorithm: "grace_hash",
-        grace_hash_join_initial_buckets: "32",
-      },
-    },
-  });
+    WHERE t.project_id = ${projectId}
+      AND t.timestamp >= ${minTimestamp}
+      AND t.timestamp <= ${maxTimestamp}
+  `);
 
   const baseUrl = env.NEXTAUTH_URL?.replace("/api/auth", "");
 
-  for await (const record of records) {
+  for (const record of records) {
     yield {
       timestamp: record.timestamp,
       langfuse_id: record.id,
@@ -1477,6 +1276,7 @@ export const getTracesForAnalyticsIntegrations = async function* (
  * We expect at most 10s of calls per day, so this is acceptable.
  */
 export const getTracesByIdsForAnyProject = async (traceIds: string[]) => {
+  if (traceIds.length === 0) return [];
   return measureAndReturn({
     operationName: "getTracesByIdsForAnyProject",
     projectId: "__CROSS_PROJECT__",
@@ -1491,21 +1291,15 @@ export const getTracesByIdsForAnyProject = async (traceIds: string[]) => {
         operation_name: "getTracesByIdsForAnyProject",
       },
     },
-    fn: async (input) => {
-      const query = `
-          SELECT id, project_id
-          FROM traces
-          WHERE id IN ({traceIds: Array(String)})
-          ORDER BY event_ts DESC
-          LIMIT 1 by id, project_id;`;
-      const records = await queryClickhouse<{
-        id: string;
-        project_id: string;
-      }>({
-        query,
-        params: input.params,
-        tags: input.tags,
-      });
+    fn: async () => {
+      const records = await prisma.$queryRaw<
+        Array<{ id: string; project_id: string }>
+      >(Prisma.sql`
+        SELECT DISTINCT ON (id, project_id) id, project_id
+        FROM traces
+        WHERE id IN (${Prisma.join(traceIds)})
+        ORDER BY id, project_id, event_ts DESC
+      `);
 
       return records.map((record) => ({
         id: record.id,
@@ -1520,37 +1314,49 @@ export async function getAgentGraphData(params: {
   traceId: string;
   chMinStartTime: string;
   chMaxStartTime: string;
-}) {
+}): Promise<
+  Array<{
+    id: string;
+    parent_observation_id: string | null;
+    type: string;
+    name: string;
+    start_time: string;
+    end_time: string | null;
+    node: string | null;
+    step: number | null;
+  }>
+> {
   const { projectId, traceId, chMinStartTime, chMaxStartTime } = params;
+  const minStartTime = parseClickhouseUTCDateTimeFormat(chMinStartTime);
+  const maxStartTime = parseClickhouseUTCDateTimeFormat(chMaxStartTime);
 
-  const query = `
-          SELECT
-            id,
-            parent_observation_id,
-            type,
-            name,
-            start_time,
-            end_time,
-            metadata['langgraph_node'] AS node,
-            metadata['langgraph_step'] AS step
-          FROM
-            observations
-          WHERE
-            project_id = {projectId: String}
-            AND trace_id = {traceId: String}
-            AND start_time >= {chMinStartTime: DateTime64(3)}
-            AND start_time <= {chMaxStartTime: DateTime64(3)}
-        `;
-
-  return queryClickhouse({
-    query,
-    params: {
-      traceId,
-      projectId,
-      chMinStartTime,
-      chMaxStartTime,
-    },
-  });
+  return prisma.$queryRaw<
+    Array<{
+      id: string;
+      parent_observation_id: string | null;
+      type: string;
+      name: string;
+      start_time: string;
+      end_time: string | null;
+      node: string | null;
+      step: number | null;
+    }>
+  >(Prisma.sql`
+    SELECT
+      id,
+      parent_observation_id,
+      type::text as type,
+      name,
+      start_time::text as start_time,
+      end_time::text as end_time,
+      metadata->>'langgraph_node' AS node,
+      NULLIF(metadata->>'langgraph_step','')::int AS step
+    FROM observations
+    WHERE project_id = ${projectId}
+      AND trace_id = ${traceId}
+      AND start_time >= ${minStartTime}
+      AND start_time <= ${maxStartTime}
+  `);
 }
 
 /**
@@ -1576,7 +1382,7 @@ export async function getAgentGraphData(params: {
  * //   ...
  * // ]
  *
- * Note: Skips using FINAL (double counting risk) for faster and cheaper
+ * Note: Uses non-deduplicating reads for faster and cheaper queries.
  * queries against clickhouse. Generous 4x overcompensation before blocking allows
  * for usage aggregation to be meaningful.
  *
@@ -1588,33 +1394,18 @@ export const getTraceCountsByProjectAndDay = async ({
   startDate: Date;
   endDate: Date;
 }) => {
-  const query = `
+  const rows = await prisma.$queryRaw<
+    Array<{ count: bigint; project_id: string; date: string }>
+  >(Prisma.sql`
     SELECT
-      count(*) as count,
+      count(*)::bigint as count,
       project_id,
-      toDate(timestamp) as date
+      DATE(timestamp)::text as date
     FROM traces
-    WHERE timestamp >= {startDate: DateTime64(3)}
-    AND timestamp < {endDate: DateTime64(3)}
-    GROUP BY project_id, toDate(timestamp)
-  `;
-
-  const rows = await queryClickhouse<{
-    count: string;
-    project_id: string;
-    date: string;
-  }>({
-    query,
-    params: {
-      startDate: convertDateToClickhouseDateTime(startDate),
-      endDate: convertDateToClickhouseDateTime(endDate),
-    },
-    tags: {
-      feature: "tracing",
-      type: "trace",
-      kind: "analytic",
-    },
-  });
+    WHERE timestamp >= ${startDate}
+      AND timestamp < ${endDate}
+    GROUP BY project_id, DATE(timestamp)
+  `);
 
   return rows.map((row) => ({
     count: Number(row.count),

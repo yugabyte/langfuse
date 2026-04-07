@@ -3,9 +3,9 @@ import {
   type TableViewPresetTableName,
   type FilterState,
   type OrderByState,
-  type TableViewPresetState,
   type ColumnDefinition,
 } from "@langfuse/shared";
+import type { TableViewPresetState } from "@/src/components/table/table-view-presets/types";
 import { type DefaultViewScope } from "@langfuse/shared/src/server";
 import { useRouter } from "next/router";
 import { useEffect, useCallback, useState, useRef } from "react";

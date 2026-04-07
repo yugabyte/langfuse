@@ -9,6 +9,7 @@ import {
   getTracingTabs,
   TRACING_TABS,
 } from "@/src/features/navigation/utils/tracing-tabs";
+import { OBSERVATIONS_TAB_ENABLED } from "@/src/features/tracing/tracing-ui-config";
 import { useV4Beta } from "@/src/features/events/hooks/useV4Beta";
 import ObservationsEventsTable from "@/src/features/events/components/EventsTable";
 import { useQueryProject } from "@/src/features/projects/hooks";
@@ -88,12 +89,13 @@ export default function Traces() {
           ),
           href: "https://langfuse.com/docs/observability/data-model",
         },
-        tabsProps: isBetaEnabled
-          ? undefined
-          : {
-              tabs: getTracingTabs(projectId),
-              activeTab: TRACING_TABS.TRACES,
-            },
+        tabsProps:
+          isBetaEnabled || !OBSERVATIONS_TAB_ENABLED
+            ? undefined
+            : {
+                tabs: getTracingTabs(projectId),
+                activeTab: TRACING_TABS.TRACES,
+              },
       }}
     >
       {isBetaEnabled ? (

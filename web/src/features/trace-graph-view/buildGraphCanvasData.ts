@@ -152,7 +152,7 @@ export function buildGraphFromStepData(
     ) {
       return {
         id: nodeName,
-        label: nodeName,
+        label: nodeName === LANGFUSE_START_NODE_NAME ? "start" : "end",
         type: "LANGGRAPH_SYSTEM",
       };
     }

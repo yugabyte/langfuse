@@ -90,6 +90,9 @@ export type PageProps = {
   };
   runningOnHuggingFaceSpaces: boolean;
   signUpDisabled: boolean;
+  // Auto sign-in credentials for local dev (passed server-side to avoid client env var access)
+  initUserEmail?: string;
+  initUserPassword?: string;
 };
 
 // Also used in src/pages/auth/sign-up.tsx
@@ -98,6 +101,12 @@ export const getServerSideProps: GetServerSideProps<PageProps> = async () => {
   const sso: boolean = await isAnySsoConfigured();
   return {
     props: {
+      ...(env.LANGFUSE_INIT_USER_EMAIL && env.LANGFUSE_INIT_USER_PASSWORD
+        ? {
+            initUserEmail: env.LANGFUSE_INIT_USER_EMAIL,
+            initUserPassword: env.LANGFUSE_INIT_USER_PASSWORD,
+          }
+        : {}),
       authProviders: {
         google:
           env.AUTH_GOOGLE_CLIENT_ID !== undefined &&
@@ -532,9 +541,26 @@ export default function SignIn({
   authProviders,
   signUpDisabled,
   runningOnHuggingFaceSpaces,
+  initUserEmail,
+  initUserPassword,
 }: PageProps) {
   const router = useRouter();
   useHuggingFaceRedirect(runningOnHuggingFaceSpaces);
+
+  // Auto sign-in for local dev when init user credentials are configured
+  useEffect(() => {
+    if (!initUserEmail || !initUserPassword) return;
+    const targetPath = router.query.targetPath as string | undefined;
+    const callbackUrl = targetPath ?? "/";
+    void signIn("credentials", {
+      email: initUserEmail,
+      password: initUserPassword,
+      callbackUrl,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initUserEmail, initUserPassword]);
+
+  const isAutoSigningIn = Boolean(initUserEmail && initUserPassword);
 
   // handle NextAuth error codes: https://next-auth.js.org/configuration/pages#sign-in-page
   const nextAuthError =
@@ -714,6 +740,14 @@ export default function SignIn({
     } finally {
       setContinueLoading(false);
     }
+  }
+
+  if (isAutoSigningIn) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <div className="text-center text-muted-foreground">Signing in...</div>
+      </div>
+    );
   }
 
   return (

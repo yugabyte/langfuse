@@ -1,6 +1,7 @@
 import { useRouter } from "next/router";
 import { useMemo, useEffect, useRef } from "react";
 import Page from "@/src/components/layouts/page";
+import { SCORES_PAGE_ENABLED } from "@/src/features/scores/scores-page-config";
 import {
   getScoresTabs,
   SCORES_TABS,
@@ -39,6 +40,12 @@ export default function ScoresAnalyticsV2Page() {
   const router = useRouter();
   const projectId = router.query.projectId as string;
 
+  useEffect(() => {
+    if (!SCORES_PAGE_ENABLED && projectId) {
+      router.replace(`/project/${projectId}/traces`);
+    }
+  }, [projectId, router]);
+
   const urlStateHook = useAnalyticsUrlState();
   const { state: urlState, setScore2 } = urlStateHook;
 
@@ -51,7 +58,7 @@ export default function ScoresAnalyticsV2Page() {
     error: scoresError,
   } = api.scoreAnalytics.getScoreIdentifiers.useQuery(
     { projectId },
-    { enabled: !!projectId },
+    { enabled: !!projectId && SCORES_PAGE_ENABLED },
   );
 
   // Transform API data to ScoreOption format and sort by dataType
@@ -185,6 +192,10 @@ export default function ScoresAnalyticsV2Page() {
   const hasNoScores =
     !scoresLoading && scoreOptions.length === 0 && !scoresError;
   const hasNoSelection = !hasError && !hasNoScores && !urlState.score1;
+
+  if (!SCORES_PAGE_ENABLED) {
+    return null;
+  }
 
   return (
     <Page

@@ -439,12 +439,17 @@ export function DataTableColumnVisibilityFilter<TData, TValue>({
                     className="hover:!bg-transparent"
                     onClick={() => toggleAllColumns(count, total)}
                   >
-                    <span className="text-sm font-medium">
+                    <Checkbox
+                      checked={count === total}
+                      className="mr-2 h-4 w-4"
+                      onCheckedChange={() => toggleAllColumns(count, total)}
+                    />
+                    <span className="mr-1 text-sm font-medium">
                       {count === total
                         ? "Deselect All Columns"
                         : "Select All Columns"}
                     </span>
-                    <div className="ml-1 rounded-sm bg-input px-1 text-xs">{`${count}/${total}`}</div>
+                    <div className="rounded-sm bg-input px-1 text-xs">{`${count}/${total}`}</div>
                   </Button>
                 </div>
               </div>

@@ -1,11 +1,7 @@
 import { StarTraceToggle } from "@/src/components/star-toggle";
 import { DataTable } from "@/src/components/table/data-table";
 import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
-import {
-  DataTableControlsProvider,
-  DataTableControls,
-} from "@/src/components/table/data-table-controls";
-import { ResizableFilterLayout } from "@/src/components/table/resizable-filter-layout";
+import { DataTableControlsProvider } from "@/src/components/table/data-table-controls";
 import { Badge } from "@/src/components/ui/badge";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
 import { TokenUsageBadge } from "@/src/components/token-usage-badge";
@@ -607,7 +603,7 @@ export default function TracesTable({
       enableSorting,
       cell: ({ row }) => {
         const value: TracesTableRow["name"] = row.getValue("name");
-        return value ?? undefined;
+        return value ? value : <span className="text-muted-foreground">-</span>;
       },
     },
     {
@@ -629,6 +625,7 @@ export default function TracesTable({
           />
         );
       },
+      defaultHidden: true,
       enableHiding: true,
     },
     {
@@ -651,6 +648,7 @@ export default function TracesTable({
         );
       },
       enableHiding: true,
+      defaultHidden: true,
     },
     {
       accessorKey: "levelCounts",
@@ -685,7 +683,9 @@ export default function TracesTable({
         if (!traceMetrics.data) return <Skeleton className="h-3 w-1/2" />;
         return value !== undefined ? (
           <span className="text-nowrap">{formatIntervalSeconds(value)}</span>
-        ) : undefined;
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        );
       },
       enableHiding: true,
       enableSorting,
@@ -700,7 +700,7 @@ export default function TracesTable({
         const value: TracesTableRow["usage"] = row.getValue("usage");
         if (!traceMetrics.data) return <Skeleton className="h-3 w-1/2" />;
         if (!value.inputUsage && !value.outputUsage && !value.totalUsage) {
-          return null;
+          return <span className="text-muted-foreground">0</span>;
         }
 
         return (
@@ -734,12 +734,14 @@ export default function TracesTable({
               {cost ? (
                 <span>{usdFormatter(cost.toNumber())}</span>
               ) : (
-                <span>-</span>
+                <span>$0.00</span>
               )}
               <InfoIcon className="h-3 w-3" />
             </div>
           </BreakdownTooltip>
-        ) : null;
+        ) : (
+          <span className="text-muted-foreground">$0.00</span>
+        );
       },
       enableHiding: true,
       enableSorting,
@@ -760,7 +762,9 @@ export default function TracesTable({
           >
             {value}
           </Badge>
-        ) : null;
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        );
       },
     },
     {
@@ -841,6 +845,7 @@ export default function TracesTable({
         );
       },
       enableHiding: true,
+      defaultHidden: true,
     },
     ...(hideControls
       ? []
@@ -888,7 +893,9 @@ export default function TracesTable({
         const value: TracesTableRow["sessionId"] = row.getValue("sessionId");
         return value && typeof value === "string" ? (
           <TableIdOrName value={value} />
-        ) : undefined;
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        );
       },
       defaultHidden: true,
       enableHiding: true,
@@ -922,7 +929,9 @@ export default function TracesTable({
         const value: TracesTableRow["userId"] = row.getValue("userId");
         return value && typeof value === "string" ? (
           <TableIdOrName value={value} />
-        ) : undefined;
+        ) : (
+          <span className="text-muted-foreground">absent</span>
+        );
       },
       defaultHidden: true,
       enableHiding: true,
@@ -937,7 +946,6 @@ export default function TracesTable({
         description: "The number of observations in the trace.",
       },
       enableHiding: true,
-      defaultHidden: true,
       cell: ({ row }) => {
         const value: TracesTableRow["observationCount"] =
           row.getValue("observationCount");
@@ -967,7 +975,6 @@ export default function TracesTable({
           <span>-</span>
         );
       },
-      defaultHidden: true,
       enableHiding: true,
       enableSorting,
     },
@@ -976,6 +983,14 @@ export default function TracesTable({
       id: "version",
       header: "Version",
       size: 100,
+      cell: ({ row }) => {
+        const value: TracesTableRow["version"] = row.getValue("version");
+        return value ? (
+          value
+        ) : (
+          <span className="text-muted-foreground">absent</span>
+        );
+      },
       headerTooltip: {
         description: (
           <>
@@ -1003,6 +1018,14 @@ export default function TracesTable({
       id: "release",
       header: "Release",
       size: 100,
+      cell: ({ row }) => {
+        const value: TracesTableRow["release"] = row.getValue("release");
+        return value ? (
+          value
+        ) : (
+          <span className="text-muted-foreground">absent</span>
+        );
+      },
       headerTooltip: {
         description: (
           <>
@@ -1375,54 +1398,47 @@ export default function TracesTable({
           />
         )}
 
-        {/* Content area with sidebar and table */}
-        <ResizableFilterLayout>
-          {!hideControls && (
-            <DataTableControls queryFilter={queryFilter} filterWithAI />
-          )}
-
-          <div className="flex flex-1 flex-col overflow-hidden">
-            <DataTable
-              columns={columns}
-              hidePagination={hideControls}
-              data={
-                traces.isPending || isViewLoading
-                  ? { isLoading: true, isError: false }
-                  : traces.isError
-                    ? {
-                        isLoading: false,
-                        isError: true,
-                        error: traces.error.message,
-                      }
-                    : {
-                        isLoading: false,
-                        isError: false,
-                        data: rows,
-                      }
-              }
-              pagination={
-                limitRows
-                  ? undefined
-                  : {
-                      totalCount,
-                      onChange: setPaginationState,
-                      state: paginationState,
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <DataTable
+            columns={columns}
+            hidePagination={hideControls}
+            data={
+              traces.isPending || isViewLoading
+                ? { isLoading: true, isError: false }
+                : traces.isError
+                  ? {
+                      isLoading: false,
+                      isError: true,
+                      error: traces.error.message,
                     }
-              }
-              setOrderBy={setOrderByState}
-              orderBy={orderByState}
-              rowSelection={selectedRows}
-              setRowSelection={setSelectedRows}
-              columnVisibility={columnVisibility}
-              onColumnVisibilityChange={setColumnVisibility}
-              columnOrder={columnOrder}
-              onColumnOrderChange={setColumnOrder}
-              rowHeight={rowHeight}
-              peekView={peekConfig}
-              tableName={"traces"}
-            />
-          </div>
-        </ResizableFilterLayout>
+                  : {
+                      isLoading: false,
+                      isError: false,
+                      data: rows,
+                    }
+            }
+            pagination={
+              limitRows
+                ? undefined
+                : {
+                    totalCount,
+                    onChange: setPaginationState,
+                    state: paginationState,
+                  }
+            }
+            setOrderBy={setOrderByState}
+            orderBy={orderByState}
+            rowSelection={selectedRows}
+            setRowSelection={setSelectedRows}
+            columnVisibility={columnVisibility}
+            onColumnVisibilityChange={setColumnVisibility}
+            columnOrder={columnOrder}
+            onColumnOrderChange={setColumnOrder}
+            rowHeight={rowHeight}
+            peekView={peekConfig}
+            tableName={"traces"}
+          />
+        </div>
         {peekConfig && <TablePeekView peekView={peekConfig} />}
       </div>
     </DataTableControlsProvider>

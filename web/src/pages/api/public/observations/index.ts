@@ -1,9 +1,5 @@
 import { prisma } from "@langfuse/shared/src/db";
-import {
-  getObservationsFromEventsTableForPublicApi,
-  getObservationsCountFromEventsTableForPublicApi,
-} from "@langfuse/shared/src/server";
-import { env } from "@/src/env.mjs";
+import type { Observation } from "@langfuse/shared";
 
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
@@ -41,38 +37,20 @@ export default withMiddlewares({
         advancedFilters: query.filter,
       };
 
-      // Use events table if query parameter is explicitly set, otherwise use environment variable
-      const useEventsTable =
-        query.useEventsTable !== undefined && query.useEventsTable !== null
-          ? query.useEventsTable === true
-          : env.LANGFUSE_ENABLE_EVENTS_TABLE_OBSERVATIONS;
-
-      if (useEventsTable) {
-        const [items, count] = await Promise.all([
-          getObservationsFromEventsTableForPublicApi(filterProps),
-          getObservationsCountFromEventsTableForPublicApi(filterProps),
-        ]);
-
-        return {
-          data: items.map(transformDbToApiObservation),
-          meta: {
-            page: query.page,
-            limit: query.limit,
-            totalItems: count,
-            totalPages: Math.ceil(count / query.limit),
-          },
-        };
-      }
-
-      // Legacy code path using observations table
       const [items, count] = await Promise.all([
-        generateObservationsForPublicApi(filterProps),
-        getObservationsCountForPublicApi(filterProps),
+        generateObservationsForPublicApi({
+          props: filterProps,
+          advancedFilters: query.filter,
+        }),
+        getObservationsCountForPublicApi({
+          props: filterProps,
+          advancedFilters: query.filter,
+        }),
       ]);
       const uniqueModels: string[] = Array.from(
         new Set(
           items
-            .map((r) => r.internalModelId)
+            .map((r: Observation) => r.internalModelId)
             .filter((r): r is string => Boolean(r)),
         ),
       );
@@ -91,12 +69,15 @@ export default withMiddlewares({
               },
             })
           : [];
+      const modelById = new Map(models.map((model) => [model.id, model]));
       const finalCount = count ? count : 0;
 
       return {
         data: items
-          .map((i) => {
-            const model = models.find((m) => m.id === i.internalModelId);
+          .map((i: Observation) => {
+            const model = i.internalModelId
+              ? modelById.get(i.internalModelId)
+              : undefined;
             return {
               ...i,
               modelId: model?.id ?? null,

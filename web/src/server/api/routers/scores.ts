@@ -34,20 +34,6 @@ import {
 } from "@langfuse/shared";
 import {
   getScoresGroupedByNameSourceType,
-  getScoresUiCount,
-  getScoresUiTable,
-  getScoresUiCountFromEvents,
-  getScoresUiTableFromEvents,
-  getTraceMetadataByIdsFromEvents,
-  getScoreNames,
-  getScoreStringValues,
-  getTracesGroupedByTags,
-  getTracesGroupedByName,
-  getTracesGroupedByUsers,
-  getEventsGroupedByTraceName,
-  getEventsGroupedByTraceTags,
-  getEventsGroupedByUserId,
-  tracesTableUiColumnDefinitions,
   upsertScore,
   logger,
   getTraceById,
@@ -72,6 +58,8 @@ import {
   isTraceScore,
 } from "@/src/features/scores/lib/helpers";
 import { toDomainWithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
+import { ScoresApiService } from "@/src/features/public-api/server/scores-api-service";
+import { Prisma, prisma as tracingPrisma } from "@langfuse/shared/src/db";
 
 const ScoreFilterOptions = z.object({
   projectId: z.string(), // Required for protectedProjectProcedure
@@ -99,6 +87,322 @@ type AllScoresFromEventsReturnType = Omit<ScoreDomain, "metadata"> & {
   hasMetadata: boolean;
 };
 
+const hasMetadata = (metadata: unknown): boolean =>
+  typeof metadata === "object" &&
+  metadata !== null &&
+  !Array.isArray(metadata) &&
+  Object.keys(metadata as Record<string, unknown>).length > 0;
+
+const extractTimestampBounds = (
+  timestampFilter?: Array<z.infer<typeof timeFilter>>,
+) => {
+  let fromTimestamp: string | undefined;
+  let toTimestamp: string | undefined;
+
+  for (const filter of timestampFilter ?? []) {
+    if (filter.column !== "timestamp") continue;
+    const value = new Date(filter.value).toISOString();
+    if (filter.operator === ">" || filter.operator === ">=") {
+      if (!fromTimestamp || value > fromTimestamp) fromTimestamp = value;
+    }
+    if (filter.operator === "<" || filter.operator === "<=") {
+      if (!toTimestamp || value < toTimestamp) toTimestamp = value;
+    }
+  }
+
+  return { fromTimestamp, toTimestamp };
+};
+
+const extractScoreQueryFromFilters = ({
+  filter,
+}: {
+  filter: FilterState;
+}): Partial<{
+  traceId: string;
+  userId: string;
+  name: string;
+  source: string;
+  dataType: string;
+  environment: string | string[];
+  traceTags: string | string[];
+  fromTimestamp: string;
+  toTimestamp: string;
+  observationId: string[];
+  sessionId: string;
+}> => {
+  const result: Partial<{
+    traceId: string;
+    userId: string;
+    name: string;
+    source: string;
+    dataType: string;
+    environment: string | string[];
+    traceTags: string | string[];
+    fromTimestamp: string;
+    toTimestamp: string;
+    observationId: string[];
+    sessionId: string;
+  }> = {};
+
+  for (const f of filter ?? []) {
+    if (f.type === "datetime" && f.column === "timestamp") {
+      const iso = new Date(f.value).toISOString();
+      if (f.operator === ">" || f.operator === ">=") {
+        if (!result.fromTimestamp || iso > result.fromTimestamp) {
+          result.fromTimestamp = iso;
+        }
+      } else if (f.operator === "<" || f.operator === "<=") {
+        if (!result.toTimestamp || iso < result.toTimestamp) {
+          result.toTimestamp = iso;
+        }
+      }
+    }
+
+    if (f.type === "string" && f.operator === "=") {
+      if (f.column === "traceId") result.traceId = f.value;
+      if (f.column === "name") result.name = f.value;
+      if (f.column === "source") result.source = f.value;
+      if (f.column === "dataType") result.dataType = f.value;
+      if (f.column === "userId") result.userId = f.value;
+      if (f.column === "sessionId") result.sessionId = f.value;
+      if (f.column === "observationId") result.observationId = [f.value];
+      if (f.column === "environment") result.environment = f.value;
+    }
+
+    if (
+      (f.type === "stringOptions" || f.type === "categoryOptions") &&
+      f.operator === "any of"
+    ) {
+      if (f.column === "userId" && f.value.length > 0)
+        result.userId = f.value[0];
+      if (f.column === "name" && f.value.length > 0) result.name = f.value[0];
+      if (f.column === "source" && f.value.length > 0)
+        result.source = f.value[0];
+      if (f.column === "dataType" && f.value.length > 0)
+        result.dataType = f.value[0];
+      if (f.column === "environment") result.environment = f.value;
+    }
+
+    if (
+      f.type === "arrayOptions" &&
+      (f.column === "trace_tags" || f.column === "tags") &&
+      f.operator === "any of"
+    ) {
+      result.traceTags = f.value;
+    }
+  }
+
+  return result;
+};
+
+const getTraceMetadataMap = async ({
+  projectId,
+  traceIds,
+}: {
+  projectId: string;
+  traceIds: string[];
+}) => {
+  if (traceIds.length === 0)
+    return new Map<
+      string,
+      { name: string | null; userId: string | null; tags: string[] | null }
+    >();
+
+  const rows = await tracingPrisma.$queryRaw<
+    Array<{
+      id: string;
+      name: string | null;
+      user_id: string | null;
+      tags: string[] | null;
+    }>
+  >(Prisma.sql`
+    SELECT DISTINCT ON (t.id, t.project_id)
+      t.id,
+      t.name,
+      t.user_id,
+      t.tags
+    FROM clickhouse.traces t
+    WHERE t.project_id = ${projectId}
+      AND t.is_deleted = false
+      AND t.id IN (${Prisma.join(traceIds)})
+    ORDER BY t.id, t.project_id, t.event_ts DESC
+  `);
+
+  return new Map(
+    rows.map((r) => [r.id, { name: r.name, userId: r.user_id, tags: r.tags }]),
+  );
+};
+
+const getScoresForUiFromYb = async ({
+  input,
+  ctx,
+}: {
+  input: z.infer<typeof ScoreAllOptions>;
+  ctx: { prisma: typeof tracingPrisma };
+}): Promise<AllScoresReturnType[]> => {
+  const service = new ScoresApiService("v2");
+  const extracted = extractScoreQueryFromFilters({
+    filter: input.filter ?? [],
+  });
+  const page = input.page + 1; // UI is 0-based, public-api service expects 1-based
+
+  const items = (await service.generateScoresForPublicApi({
+    projectId: input.projectId,
+    page,
+    limit: input.limit,
+    fields: ["score", "trace"],
+    ...extracted,
+  })) as Array<
+    ScoreDomain & {
+      trace?: { userId?: string | null; tags?: string[] | null } | null;
+    }
+  >;
+
+  const traceIds = Array.from(
+    new Set(
+      items.map((s) => s.traceId).filter((id): id is string => Boolean(id)),
+    ),
+  );
+  const traceMetaById = await getTraceMetadataMap({
+    projectId: input.projectId,
+    traceIds,
+  });
+
+  const [jobExecutions, users] = await Promise.all([
+    ctx.prisma.jobExecution.findMany({
+      where: {
+        projectId: input.projectId,
+        jobOutputScoreId: {
+          in: items.map((score) => score.id),
+        },
+      },
+      select: {
+        id: true,
+        jobConfigurationId: true,
+        jobOutputScoreId: true,
+      },
+    }),
+    ctx.prisma.user.findMany({
+      where: {
+        id: {
+          in: items
+            .map((score) => score.authorUserId)
+            .filter((s): s is string => Boolean(s)),
+        },
+      },
+      select: {
+        id: true,
+        name: true,
+        image: true,
+      },
+    }),
+  ]);
+
+  return items.map<AllScoresReturnType>((score) => {
+    const jobExecution = jobExecutions.find(
+      (je) => je.jobOutputScoreId === score.id,
+    );
+    const user = users.find((u) => u.id === score.authorUserId);
+    const traceMeta = score.traceId
+      ? traceMetaById.get(score.traceId)
+      : undefined;
+
+    return {
+      ...score,
+      longStringValue: score.longStringValue ?? "",
+      metadata: undefined as never,
+      traceName: traceMeta?.name ?? null,
+      traceUserId: traceMeta?.userId ?? score.trace?.userId ?? null,
+      traceTags: traceMeta?.tags ?? score.trace?.tags ?? null,
+      jobConfigurationId: jobExecution?.jobConfigurationId ?? null,
+      authorUserImage: user?.image ?? null,
+      authorUserName: user?.name ?? null,
+      hasMetadata: hasMetadata((score as { metadata?: unknown }).metadata),
+    };
+  });
+};
+
+const getScoreFilterOptionsFromYb = async ({
+  projectId,
+  timestampFilter,
+}: {
+  projectId: string;
+  timestampFilter?: Array<z.infer<typeof timeFilter>>;
+}) => {
+  const { fromTimestamp, toTimestamp } =
+    extractTimestampBounds(timestampFilter);
+
+  const timeSql = Prisma.sql`
+    ${fromTimestamp ? Prisma.sql`AND s.timestamp >= ${new Date(fromTimestamp)}` : Prisma.empty}
+    ${toTimestamp ? Prisma.sql`AND s.timestamp <= ${new Date(toTimestamp)}` : Prisma.empty}
+  `;
+
+  const [names, stringValues, traceNames, userIds, tags] = await Promise.all([
+    tracingPrisma.$queryRaw<Array<{ value: string; count: bigint }>>(Prisma.sql`
+      SELECT s.name AS value, count(*)::bigint AS count
+      FROM clickhouse.scores s
+      WHERE s.project_id = ${projectId}
+        AND s.is_deleted = false
+        ${timeSql}
+      GROUP BY s.name
+      ORDER BY count(*) DESC
+      LIMIT 1000
+    `),
+    tracingPrisma.$queryRaw<Array<{ value: string; count: bigint }>>(Prisma.sql`
+      SELECT s.string_value AS value, count(*)::bigint AS count
+      FROM clickhouse.scores s
+      WHERE s.project_id = ${projectId}
+        AND s.is_deleted = false
+        AND s.string_value IS NOT NULL
+        ${timeSql}
+      GROUP BY s.string_value
+      ORDER BY count(*) DESC
+      LIMIT 1000
+    `),
+    tracingPrisma.$queryRaw<Array<{ value: string; count: bigint }>>(Prisma.sql`
+      SELECT t.name AS value, count(*)::bigint AS count
+      FROM clickhouse.traces t
+      WHERE t.project_id = ${projectId}
+        AND t.is_deleted = false
+      GROUP BY t.name
+      ORDER BY count(*) DESC
+      LIMIT 1000
+    `),
+    tracingPrisma.$queryRaw<Array<{ value: string; count: bigint }>>(Prisma.sql`
+      SELECT t.user_id AS value, count(*)::bigint AS count
+      FROM clickhouse.traces t
+      WHERE t.project_id = ${projectId}
+        AND t.is_deleted = false
+        AND t.user_id IS NOT NULL
+      GROUP BY t.user_id
+      ORDER BY count(*) DESC
+      LIMIT 1000
+    `),
+    tracingPrisma.$queryRaw<Array<{ value: string }>>(Prisma.sql`
+      SELECT DISTINCT unnest(t.tags) AS value
+      FROM clickhouse.traces t
+      WHERE t.project_id = ${projectId}
+        AND t.is_deleted = false
+        AND t.tags IS NOT NULL
+      LIMIT 1000
+    `),
+  ]);
+
+  return {
+    name: names.map((n) => ({ value: n.value, count: Number(n.count) })),
+    tags: tags.map((t) => ({ value: t.value })),
+    traceName: traceNames.map((n) => ({
+      value: n.value,
+      count: Number(n.count),
+    })),
+    userId: userIds.map((u) => ({ value: u.value, count: Number(u.count) })),
+    stringValue: stringValues.map((s) => ({
+      value: s.value,
+      count: Number(s.count),
+    })),
+  };
+};
+
 export const scoresRouter = createTRPCRouter({
   /**
    * Get all scores for a project, meant for internal use and *excludes metadata of scores*
@@ -106,60 +410,8 @@ export const scoresRouter = createTRPCRouter({
   all: protectedProjectProcedure
     .input(ScoreAllOptions)
     .query(async ({ input, ctx }) => {
-      const clickhouseScoreData = await getScoresUiTable({
-        projectId: input.projectId,
-        filter: input.filter ?? [],
-        orderBy: input.orderBy,
-        limit: input.limit,
-        offset: input.page * input.limit,
-        excludeMetadata: true,
-        includeHasMetadataFlag: true,
-      });
-
-      const [jobExecutions, users] = await Promise.all([
-        ctx.prisma.jobExecution.findMany({
-          where: {
-            projectId: input.projectId,
-            jobOutputScoreId: {
-              in: clickhouseScoreData.map((score) => score.id),
-            },
-          },
-          select: {
-            id: true,
-            jobConfigurationId: true,
-            jobOutputScoreId: true,
-          },
-        }),
-        ctx.prisma.user.findMany({
-          where: {
-            id: {
-              in: clickhouseScoreData
-                .map((score) => score.authorUserId)
-                .filter((s): s is string => Boolean(s)),
-            },
-          },
-          select: {
-            id: true,
-            name: true,
-            image: true,
-          },
-        }),
-      ]);
-
-      return {
-        scores: clickhouseScoreData.map<AllScoresReturnType>((score) => {
-          const jobExecution = jobExecutions.find(
-            (je) => je.jobOutputScoreId === score.id,
-          );
-          const user = users.find((u) => u.id === score.authorUserId);
-          return {
-            ...score,
-            jobConfigurationId: jobExecution?.jobConfigurationId ?? null,
-            authorUserImage: user?.image ?? null,
-            authorUserName: user?.name ?? null,
-          };
-        }),
-      };
+      const scores = await getScoresForUiFromYb({ input, ctx });
+      return { scores };
     }),
   byId: protectedProjectProcedure
     .input(
@@ -169,14 +421,14 @@ export const scoresRouter = createTRPCRouter({
       }),
     )
     .query(async ({ input }) => {
-      const score = await getScoreById({
+      const score = await new ScoresApiService("v2").getScoreById({
         projectId: input.projectId,
         scoreId: input.scoreId,
       });
       if (!score) {
         throw new TRPCError({
           code: "NOT_FOUND",
-          message: `No score with id ${input.scoreId} in project ${input.projectId} in Clickhouse`,
+          message: `No score with id ${input.scoreId} in project ${input.projectId}`,
         });
       }
       return toDomainWithStringifiedMetadata(score);
@@ -184,16 +436,21 @@ export const scoresRouter = createTRPCRouter({
   countAll: protectedProjectProcedure
     .input(ScoreAllOptions)
     .query(async ({ input }) => {
-      const clickhouseScoreData = await getScoresUiCount({
-        projectId: input.projectId,
+      const extracted = extractScoreQueryFromFilters({
         filter: input.filter ?? [],
-        orderBy: input.orderBy,
-        limit: 1,
-        offset: 0,
+      });
+      const totalCount = await new ScoresApiService(
+        "v2",
+      ).getScoresCountForPublicApi({
+        projectId: input.projectId,
+        page: input.page + 1,
+        limit: input.limit,
+        fields: ["score", "trace"],
+        ...extracted,
       });
 
       return {
-        totalCount: clickhouseScoreData,
+        totalCount,
       };
     }),
   /**
@@ -202,59 +459,12 @@ export const scoresRouter = createTRPCRouter({
   allFromEvents: protectedProjectProcedure
     .input(ScoreAllOptions)
     .query(async ({ input, ctx }) => {
-      const clickhouseScoreData = await getScoresUiTableFromEvents({
-        projectId: input.projectId,
-        filter: input.filter ?? [],
-        orderBy: input.orderBy,
-        limit: input.limit,
-        offset: input.page * input.limit,
-      });
-
-      const [jobExecutions, users] = await Promise.all([
-        ctx.prisma.jobExecution.findMany({
-          where: {
-            projectId: input.projectId,
-            jobOutputScoreId: {
-              in: clickhouseScoreData.map((score) => score.id),
-            },
-          },
-          select: {
-            id: true,
-            jobConfigurationId: true,
-            jobOutputScoreId: true,
-          },
-        }),
-        ctx.prisma.user.findMany({
-          where: {
-            id: {
-              in: clickhouseScoreData
-                .map((score) => score.authorUserId)
-                .filter((s): s is string => Boolean(s)),
-            },
-          },
-          select: {
-            id: true,
-            name: true,
-            image: true,
-          },
-        }),
-      ]);
-
+      const scores = await getScoresForUiFromYb({ input, ctx });
       return {
-        scores: clickhouseScoreData.map<AllScoresFromEventsReturnType>(
-          (score) => {
-            const jobExecution = jobExecutions.find(
-              (je) => je.jobOutputScoreId === score.id,
-            );
-            const user = users.find((u) => u.id === score.authorUserId);
-            return {
-              ...score,
-              jobConfigurationId: jobExecution?.jobConfigurationId ?? null,
-              authorUserImage: user?.image ?? null,
-              authorUserName: user?.name ?? null,
-            };
-          },
-        ),
+        scores: scores.map<AllScoresFromEventsReturnType>((score) => ({
+          ...score,
+          hasMetadata: score.hasMetadata,
+        })),
       };
     }),
   /**
@@ -263,16 +473,21 @@ export const scoresRouter = createTRPCRouter({
   countAllFromEvents: protectedProjectProcedure
     .input(ScoreAllOptions)
     .query(async ({ input }) => {
-      const count = await getScoresUiCountFromEvents({
-        projectId: input.projectId,
+      const extracted = extractScoreQueryFromFilters({
         filter: input.filter ?? [],
-        orderBy: input.orderBy,
-        limit: 1,
-        offset: 0,
+      });
+      const totalCount = await new ScoresApiService(
+        "v2",
+      ).getScoresCountForPublicApi({
+        projectId: input.projectId,
+        page: input.page + 1,
+        limit: input.limit,
+        fields: ["score", "trace"],
+        ...extracted,
       });
 
       return {
-        totalCount: count,
+        totalCount,
       };
     }),
   /**
@@ -288,16 +503,22 @@ export const scoresRouter = createTRPCRouter({
     )
     .query(async ({ input }) => {
       if (input.traceIds.length === 0) return [];
-      const rows = await getTraceMetadataByIdsFromEvents({
+      const traceMetaById = await getTraceMetadataMap({
         projectId: input.projectId,
         traceIds: input.traceIds,
       });
-      return rows.map((row) => ({
-        traceId: row.id,
-        traceName: row.name || null,
-        userId: row.user_id || null,
-        tags: row.tags && row.tags.length > 0 ? row.tags : null,
-      }));
+      return input.traceIds
+        .map((traceId) => {
+          const row = traceMetaById.get(traceId);
+          if (!row) return null;
+          return {
+            traceId,
+            traceName: row.name ?? null,
+            userId: row.userId ?? null,
+            tags: row.tags && row.tags.length > 0 ? row.tags : null,
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => Boolean(row));
     }),
   /**
    * v4: Filter options via events-backed aggregations instead of traces table.
@@ -310,49 +531,10 @@ export const scoresRouter = createTRPCRouter({
       }),
     )
     .query(async ({ input }) => {
-      const { timestampFilter } = input;
-
-      const eventsFilter: FilterState = [];
-      if (timestampFilter && timestampFilter.length > 0) {
-        eventsFilter.push(
-          ...timestampFilter.map((tf) => ({
-            ...tf,
-            column: "startTime" as const,
-          })),
-        );
-      }
-
-      const scoredTracesScope =
-        "e.trace_id IN (SELECT DISTINCT trace_id FROM scores WHERE project_id = {projectId: String})";
-
-      const [names, tags, traceNames, userIds, stringValues] =
-        await Promise.all([
-          getScoreNames(input.projectId, timestampFilter ?? []),
-          getEventsGroupedByTraceTags(input.projectId, eventsFilter, {
-            extraWhereRaw: scoredTracesScope,
-          }),
-          getEventsGroupedByTraceName(input.projectId, eventsFilter, {
-            extraWhereRaw: scoredTracesScope,
-          }),
-          getEventsGroupedByUserId(input.projectId, eventsFilter, {
-            extraWhereRaw: scoredTracesScope,
-          }),
-          getScoreStringValues(input.projectId, timestampFilter ?? []),
-        ]);
-
-      return {
-        name: names.map((i) => ({ value: i.name, count: i.count })),
-        tags: tags.map((t) => ({ value: t.tag })),
-        traceName: traceNames.map((tn) => ({
-          value: tn.traceName,
-          count: Number(tn.count),
-        })),
-        userId: userIds.map((u) => ({
-          value: u.userId,
-          count: Number(u.count),
-        })),
-        stringValue: stringValues,
-      };
+      return getScoreFilterOptionsFromYb({
+        projectId: input.projectId,
+        timestampFilter: input.timestampFilter,
+      });
     }),
   filterOptions: protectedProjectProcedure
     .input(
@@ -362,39 +544,10 @@ export const scoresRouter = createTRPCRouter({
       }),
     )
     .query(async ({ input }) => {
-      const { timestampFilter } = input;
-      const [names, tags, traceNames, userIds, stringValues] =
-        await Promise.all([
-          getScoreNames(input.projectId, timestampFilter ?? []),
-          getTracesGroupedByTags({
-            projectId: input.projectId,
-            filter: timestampFilter ?? [],
-          }),
-          getTracesGroupedByName(
-            input.projectId,
-            tracesTableUiColumnDefinitions,
-            timestampFilter ?? [],
-          ),
-          getTracesGroupedByUsers(
-            input.projectId,
-            timestampFilter ?? [],
-            undefined,
-            100, // limit to top 100 users
-            0,
-          ),
-          getScoreStringValues(input.projectId, timestampFilter ?? []),
-        ]);
-
-      return {
-        name: names.map((i) => ({ value: i.name, count: i.count })),
-        tags: tags,
-        traceName: traceNames.map((tn) => ({
-          value: tn.name,
-          count: tn.count,
-        })),
-        userId: userIds.map((u) => ({ value: u.user, count: u.count })),
-        stringValue: stringValues,
-      };
+      return getScoreFilterOptionsFromYb({
+        projectId: input.projectId,
+        timestampFilter: input.timestampFilter,
+      });
     }),
   deleteMany: protectedProjectProcedure
     .input(

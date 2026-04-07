@@ -43,13 +43,14 @@ export function DataTablePagination<TData>({
     setInputState(currentPage);
   }, [currentPage]);
 
-  const pageCount = table.getPageCount();
+  const rawPageCount = table.getPageCount();
+  const pageCount = rawPageCount === 0 ? 1 : rawPageCount;
   const setPageIndex = table.setPageIndex;
   useEffect(() => {
-    if (currentPage > pageCount && pageCount > 0) {
+    if (currentPage > pageCount && rawPageCount > 0) {
       setPageIndex(0);
     }
-  }, [currentPage, pageCount, setPageIndex]);
+  }, [currentPage, pageCount, rawPageCount, setPageIndex]);
 
   const handlePageNavigation = (newValue: string) => {
     if (newValue === "") {

@@ -14,7 +14,6 @@ import {
   GetDefaultViewInput,
   SetDefaultViewInput,
   ClearDefaultViewInput,
-  DefaultViewAssignmentsSchema,
   TableViewPresetsNamesCreatorListSchema,
 } from "@langfuse/shared/src/server";
 import {
@@ -209,7 +208,12 @@ export const TableViewPresetsRouter = createTRPCRouter({
 
   getDefaultAssignments: protectedProjectProcedure
     .input(GetDefaultViewInput)
-    .output(DefaultViewAssignmentsSchema)
+    .output(
+      z.object({
+        userDefaultViewId: z.string().nullable(),
+        projectDefaultViewId: z.string().nullable(),
+      }),
+    )
     .query(async ({ input, ctx }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
@@ -217,10 +221,24 @@ export const TableViewPresetsRouter = createTRPCRouter({
         scope: "TableViewPresets:read",
       });
 
-      return await DefaultViewService.getDefaultAssignments({
-        ...input,
-        userId: ctx.session.user?.id,
+      const defaults = await ctx.prisma.defaultView.findMany({
+        where: {
+          projectId: input.projectId,
+          viewName: input.viewName,
+          OR: ctx.session.user?.id
+            ? [{ userId: ctx.session.user.id }, { userId: null }]
+            : [{ userId: null }],
+        },
       });
+
+      return {
+        userDefaultViewId: ctx.session.user?.id
+          ? (defaults.find((d) => d.userId === ctx.session.user.id)?.viewId ??
+            null)
+          : null,
+        projectDefaultViewId:
+          defaults.find((d) => d.userId === null)?.viewId ?? null,
+      };
     }),
 
   setAsDefault: protectedProjectProcedure

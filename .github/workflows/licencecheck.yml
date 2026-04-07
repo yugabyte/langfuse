@@ -5,9 +5,7 @@ on:
     branches:
       - "main"
   merge_group:
-  pull_request:
-    branches:
-      - "main"
+  # pull_request trigger disabled so only PR Open API E2E runs on PRs.
 
 jobs:
   license_check:

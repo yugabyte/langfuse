@@ -4,107 +4,277 @@
 # All other components are bound to localhost (127.0.0.1) to only accept connections from the local machine.
 # External connections from other machines will not be able to reach these services directly.
 services:
-  langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
-    restart: always
-    depends_on: &langfuse-depends-on
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    ports:
-      - 127.0.0.1:3030:3030
-    environment: &langfuse-worker-env
-      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
-      SALT: ${SALT:-mysalt} # CHANGEME
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000} # CHANGEME: generate via `openssl rand -hex 32`
-      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
-      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
-      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
-      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
-      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
-      LANGFUSE_USE_AZURE_BLOB: ${LANGFUSE_USE_AZURE_BLOB:-false}
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
-      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
-      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
-      LANGFUSE_S3_BATCH_EXPORT_ENABLED: ${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}
-      LANGFUSE_S3_BATCH_EXPORT_BUCKET: ${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}
-      LANGFUSE_S3_BATCH_EXPORT_PREFIX: ${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}
-      LANGFUSE_S3_BATCH_EXPORT_REGION: ${LANGFUSE_S3_BATCH_EXPORT_REGION:-auto}
-      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:9090}
-      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
-      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: ${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}
-      LANGFUSE_INGESTION_QUEUE_DELAY_MS: ${LANGFUSE_INGESTION_QUEUE_DELAY_MS:-}
-      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS: ${LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS:-}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_AUTH: ${REDIS_AUTH:-myredissecret} # CHANGEME
-      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
-      REDIS_TLS_CA: ${REDIS_TLS_CA:-/certs/ca.crt}
-      REDIS_TLS_CERT: ${REDIS_TLS_CERT:-/certs/redis.crt}
-      REDIS_TLS_KEY: ${REDIS_TLS_KEY:-/certs/redis.key}
-      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
-      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
-    restart: always
-    depends_on: *langfuse-depends-on
+    image: langfuse-web:local
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NEXT_PUBLIC_BASE_PATH: ""
+      cache_from:
+        - langfuse-web:local
+    container_name: ${WEB_CONTAINER_NAME:-langfuse-web}
+    restart: unless-stopped
     ports:
-      - 3000:3000
+      - "${WEB_HOST_PORT:-3000}:3000"
+    # Keep web decoupled from worker for faster local iteration.
+    # Start worker separately only when needed.
+    depends_on:
+      langfuse-worker:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      yugabyte-db:
+        condition: service_healthy
+      yb-metadata-schema-init:
+        condition: service_completed_successfully
+      yb-tracing-schema-init:
+        condition: service_completed_successfully
     environment:
-      <<: *langfuse-worker-env
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME
-      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
-      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
-      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
-      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
-      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
-      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
-      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+      DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
+      TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse?schema=clickhouse"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_AUTH: "${REDIS_AUTH:-myredissecret}"
 
-  clickhouse:
-    image: docker.io/clickhouse/clickhouse-server
-    restart: always
-    user: "101:101"
-    environment:
-      CLICKHOUSE_DB: default
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
-    volumes:
-      - langfuse_clickhouse_data:/var/lib/clickhouse
-      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      # S3 / MinIO — internal Docker endpoint
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: "${LANGFUSE_S3_EVENT_UPLOAD_REGION:-us-east-1}"
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}"
+
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}"
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: "${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-us-east-1}"
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}"
+
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-true}"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: "${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}"
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: "${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}"
+      LANGFUSE_S3_BATCH_EXPORT_REGION: "${LANGFUSE_S3_BATCH_EXPORT_REGION:-us-east-1}"
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: "${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:${MINIO_API_PORT:-19090}}"
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}"
+
+      # Auth
+      NEXTAUTH_URL: "http://localhost:5000"
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET:-secret}"
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-meko-local-admin-key}"
+      LANGFUSE_EE_LICENSE_KEY: "${LANGFUSE_EE_LICENSE_KEY:-langfuse_ee_local_dev}"
+
+      # App config
+      SALT: "${SALT:-salt}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"
+      TELEMETRY_ENABLED: "${TELEMETRY_ENABLED:-false}"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}"
+      LANGFUSE_AUTO_POSTGRES_MIGRATION_DISABLED: "${LANGFUSE_AUTO_POSTGRES_MIGRATION_DISABLED:-true}"
+      LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED: "${LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED:-true}"
+      # NEXT_PUBLIC_LANGFUSE_CLOUD_REGION intentionally omitted:
+      # setting it triggers dd-trace at runtime, which is only installed
+      # in the image when passed as a build ARG (not set for local builds).
+      NEXT_PUBLIC_LANGFUSE_RUN_NEXT_INIT: "${NEXT_PUBLIC_LANGFUSE_RUN_NEXT_INIT:-true}"
+      NEXT_PUBLIC_BASE_PATH: ""
+
+      # Bootstrap user / org / projecti
+      # TODO: this to to avoid the sign in/sign up step.
+      LANGFUSE_INIT_ORG_ID: "${LANGFUSE_INIT_ORG_ID:-11111111-1111-4111-8111-111111111111}"
+      LANGFUSE_INIT_ORG_NAME: "${LANGFUSE_INIT_ORG_NAME:-Tracing Only Org}"
+      LANGFUSE_INIT_PROJECT_ID: "${LANGFUSE_INIT_PROJECT_ID:-22222222-2222-4222-8222-222222222222}"
+      LANGFUSE_INIT_PROJECT_NAME: "${LANGFUSE_INIT_PROJECT_NAME:-Tracing Project}"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-local-tracing-project}"
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-local-tracing-project-secret}"
+      LANGFUSE_INIT_USER_EMAIL: "${LANGFUSE_INIT_USER_EMAIL:-owner@local.langfuse}"
+      LANGFUSE_INIT_USER_NAME: "${LANGFUSE_INIT_USER_NAME:-Tracing Owner}"
+      LANGFUSE_INIT_USER_PASSWORD: "${LANGFUSE_INIT_USER_PASSWORD:-password123}"
+
+      # Worker flags (same as .env)
+      LANGFUSE_ENABLE_BACKGROUND_MIGRATIONS: "${LANGFUSE_ENABLE_BACKGROUND_MIGRATIONS:-false}"
+      LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED: "${LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED:-false}"
+      LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED: "${LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED:-false}"
+      LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED: "${LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED:-false}"
+
+  langfuse-worker:
+    image: langfuse-worker:local
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+      cache_from:
+        - langfuse-worker:local
+    container_name: ${WORKER_CONTAINER_NAME:-langfuse-worker}
+    restart: unless-stopped
+    depends_on:
+      yb-metadata-schema-init:
+        condition: service_completed_successfully
+      yb-tracing-schema-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      yugabyte-db:
+        condition: service_started
     ports:
-      - 127.0.0.1:8123:8123
-      - 127.0.0.1:9000:9000
+      - "${WORKER_HOST_PORT:-3030}:3030"
+    environment:
+      DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse"
+      TRACING_DATABASE_URL: "postgresql://yugabyte:yugabyte@yugabyte-db:5433/langfuse?schema=clickhouse"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_AUTH: "${REDIS_AUTH:-myredissecret}"
+
+      # S3 / MinIO
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: "${LANGFUSE_S3_EVENT_UPLOAD_REGION:-us-east-1}"
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}"
+
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}"
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: "${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-us-east-1}"
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}"
+
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-true}"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: "${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}"
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: "${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}"
+      LANGFUSE_S3_BATCH_EXPORT_REGION: "${LANGFUSE_S3_BATCH_EXPORT_REGION:-us-east-1}"
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}"
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret}"
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}"
+
+      # App config
+      NEXTAUTH_URL: "http://localhost:5000"
+      SALT: "${SALT:-salt}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"
+      TELEMETRY_ENABLED: "${TELEMETRY_ENABLED:-false}"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}"
+      LANGFUSE_DISABLE_CLICKHOUSE_WRITES: "${LANGFUSE_DISABLE_CLICKHOUSE_WRITES:-true}"
+
+      # Worker queue flags
+      LANGFUSE_ENABLE_BACKGROUND_MIGRATIONS: "${LANGFUSE_ENABLE_BACKGROUND_MIGRATIONS:-false}"
+      LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED: "${LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED:-false}"
+      LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED: "${LANGFUSE_BATCH_DATA_RETENTION_CLEANER_ENABLED:-false}"
+      LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED: "${LANGFUSE_BATCH_TRACE_DELETION_CLEANER_ENABLED:-false}"
+      QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED: "${QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED:-true}"
+      QUEUE_CONSUMER_OTEL_INGESTION_QUEUE_IS_ENABLED: "${QUEUE_CONSUMER_OTEL_INGESTION_QUEUE_IS_ENABLED:-true}"
+
+
+  yugabyte-db:
+    container_name: yugabyte-db
+    hostname: yugabyte-db
+    image: yugabytedb/yugabyte:2025.2.1.0-b141
+    platform: linux/amd64
+    command:
+    - sh
+    - -c
+    - |
+      bin/yugabyted start \
+        --fault_tolerance=zone \
+        --daemon=false \
+        --advertise_address=yugabyte-db \
+        --cloud_location=cloud.region.zone1 \
+        --base_dir=/var/lib/yugabyte/data
+
+    restart: unless-stopped
+
+    cap_add:
+      - NET_ADMIN
+
+    ports:
+      - "${YB_CLICKHOUSE_HOST_PORT:-54433}:5433"
+
+    # Persistent storage for YugabyteDB data
+    volumes:
+      - langfuse_clickhouse_yugabyte_data:/var/lib/yugabyte/data
+    
     healthcheck:
-      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 1s
+      test:
+        [
+          "CMD",
+          "/home/yugabyte/postgres/bin/pg_isready",
+          "-h",
+          "yugabyte-db",
+          "-p",
+          "5433",
+          "-U",
+          "yugabyte",
+          "-d",
+          "yugabyte",
+        ]
+
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 180s
+
+  yb-tracing-schema-init:
+    image: yugabytedb/yugabyte:2025.2.1.0-b141
+    depends_on:
+      yugabyte-db:
+        condition: service_healthy
+      yb-metadata-schema-init:
+        condition: service_completed_successfully
+    command: >
+      bash -eu -o pipefail -c '
+        YSQL="./bin/ysqlsh -h yugabyte-db -p 5433 -U yugabyte"
+        PG_READY="/home/yugabyte/postgres/bin/pg_isready -h yugabyte-db -p 5433 -U yugabyte"
+
+        until $$PG_READY -d yugabyte; do sleep 10; done
+
+        db_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='\''langfuse'\''" | tr -d "[:space:]")"
+        if [ "$$db_exists" != "1" ]; then
+          $$YSQL -d yugabyte -c "CREATE DATABASE langfuse"
+        fi
+
+        $$YSQL -d langfuse -c "CREATE SCHEMA IF NOT EXISTS clickhouse"
+        PGOPTIONS="-c search_path=clickhouse,public" \
+          $$YSQL -d langfuse -f /schema/tracing_postgres_schema.sql
+      '
+    volumes:
+      - ./tracing_postgres_schema.sql:/schema/tracing_postgres_schema.sql:ro
+    restart: "no"
+
+  yb-metadata-schema-init:
+    image: yugabytedb/yugabyte:2025.2.1.0-b141
+    depends_on:
+      yugabyte-db:
+        condition: service_healthy
+    command: >
+      bash -eu -o pipefail -c '
+        YSQL="./bin/ysqlsh -h yugabyte-db -p 5433 -U yugabyte"
+        PG_READY="/home/yugabyte/postgres/bin/pg_isready -h yugabyte-db -p 5433 -U yugabyte"
+
+        until $$PG_READY -d yugabyte; do sleep 10; done
+
+        db_exists="$$($$YSQL -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='\''langfuse'\''" | tr -d "[:space:]")"
+        if [ "$$db_exists" != "1" ]; then
+          # First-time setup: create metadata DB and load yb_postgres_data.sql.
+          $$YSQL -d yugabyte -c "CREATE DATABASE langfuse"
+          $$YSQL -d langfuse -v ON_ERROR_STOP=1 -f /schema/yb_postgres_data.sql
+        else
+          echo "Database langfuse already exists; skipping yb_postgres_data.sql import."
+        fi
+      '
+    volumes:
+      - ./yb_postgres_data.sql:/schema/yb_postgres_data.sql:ro
+    restart: "no"
 
   minio:
     image: cgr.dev/chainguard/minio
@@ -114,10 +284,10 @@ services:
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret} # CHANGEME
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
     ports:
-      - 9090:9000
-      - 127.0.0.1:9091:9001
+      - "${MINIO_API_PORT:-19090}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-19091}:9001"
     volumes:
       - langfuse_minio_data:/data
     healthcheck:
@@ -133,42 +303,24 @@ services:
     # CHANGEME: row below to secure redis password
     command: >
       --requirepass ${REDIS_AUTH:-myredissecret}
+      --port 6379
       --maxmemory-policy noeviction
     ports:
-      - 127.0.0.1:6379:6379
+      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:6379"
     volumes:
       - langfuse_redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -p 6379 -a ${REDIS_AUTH:-myredissecret} ping | grep -q PONG",
+        ]
       interval: 3s
       timeout: 10s
       retries: 10
 
-  postgres:
-    image: docker.io/postgres:${POSTGRES_VERSION:-17}
-    restart: always
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 3s
-      timeout: 3s
-      retries: 10
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres} # CHANGEME
-      POSTGRES_DB: ${POSTGRES_DB:-postgres}
-      TZ: UTC
-      PGTZ: UTC
-    ports:
-      - 127.0.0.1:5432:5432
-    volumes:
-      - langfuse_postgres_data:/var/lib/postgresql/data
-
 volumes:
-  langfuse_postgres_data:
-    driver: local
-  langfuse_clickhouse_data:
-    driver: local
-  langfuse_clickhouse_logs:
+  langfuse_clickhouse_yugabyte_data:
     driver: local
   langfuse_minio_data:
     driver: local

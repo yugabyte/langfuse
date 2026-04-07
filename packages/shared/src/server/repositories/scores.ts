@@ -5,12 +5,7 @@ import {
   AGGREGATABLE_SCORE_TYPES,
   AggregatableScoreDataType,
 } from "../../domain/scores";
-import {
-  commandClickhouse,
-  queryClickhouse,
-  queryClickhouseStream,
-  upsertClickhouse,
-} from "./clickhouse";
+import { queryClickhouse, queryClickhouseStream } from "./clickhouse";
 import { FilterList, orderByToClickhouseSql } from "../queries";
 import { FilterCondition, FilterState, TimeFilter } from "../../types";
 import {
@@ -28,7 +23,6 @@ import {
   convertClickhouseScoreToDomain,
   ScoreAggregation,
 } from "./scores_converters";
-import { SCORE_TO_TRACE_OBSERVATIONS_INTERVAL } from "./constants";
 import {
   convertDateToClickhouseDateTime,
   PreferredClickhouseService,
@@ -40,10 +34,120 @@ import { parseMetadataCHRecordToDomain } from "../utils/metadata_conversion";
 import type { AnalyticsScoreEvent } from "../analytics-integrations/types";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { recordDistribution } from "../instrumentation";
-import { prisma } from "../../db";
+import { prisma as metadataPrisma, tracingPrisma as prisma } from "../../db";
 import { measureAndReturn } from "../clickhouse/measureAndReturn";
-import { scoresColumnsTableUiColumnDefinitions } from "../tableMappings/mapScoresColumnsTable";
 import { eventsTraceMetadata } from "../queries/clickhouse-sql/query-fragments";
+import { Prisma } from "@prisma/client";
+import { logger } from "../logger";
+
+const serializeErrorForLogs = (error: unknown) => {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { message: String(error) };
+};
+
+const stringifyErrorForMessage = (error: unknown) =>
+  JSON.stringify(serializeErrorForLogs(error));
+
+const toClickhouseDateTimeString = (value: Date | null | undefined) =>
+  value ? value.toISOString().replace("T", " ").replace("Z", "") : undefined;
+
+const toClickhouseMetadataRecord = (value: unknown): Record<string, string> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+      k,
+      typeof v === "string" ? v : JSON.stringify(v),
+    ]),
+  );
+};
+
+const jsonbHasAnyKeys = (value: unknown) =>
+  !!value &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  Object.keys(value as Record<string, unknown>).length > 0;
+
+const toScoreRecordReadType = (score: {
+  id: string;
+  timestamp: Date;
+  project_id: string;
+  name: string | null;
+  value: number | null;
+  source: string;
+  author_user_id: string | null;
+  comment: string | null;
+  trace_id: string | null;
+  observation_id: string | null;
+  config_id: string | null;
+  string_value: string | null;
+  queue_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+  data_type: string;
+  metadata: Record<string, unknown> | null;
+  session_id: string | null;
+  dataset_run_id: string | null;
+  environment: string | null;
+  long_string_value: string | null;
+  execution_trace_id: string | null;
+  event_ts: Date;
+  is_deleted: boolean;
+}): ScoreRecordReadType => ({
+  id: score.id,
+  timestamp: toClickhouseDateTimeString(score.timestamp) ?? "",
+  project_id: score.project_id,
+  name: score.name ?? "",
+  value: score.value ?? 0,
+  source: score.source,
+  author_user_id: score.author_user_id,
+  comment: score.comment,
+  trace_id: score.trace_id,
+  observation_id: score.observation_id,
+  config_id: score.config_id,
+  string_value: score.string_value,
+  queue_id: score.queue_id,
+  created_at: toClickhouseDateTimeString(score.created_at) ?? "",
+  updated_at: toClickhouseDateTimeString(score.updated_at) ?? "",
+  data_type: score.data_type,
+  metadata: toClickhouseMetadataRecord(score.metadata),
+  session_id: score.session_id,
+  dataset_run_id: score.dataset_run_id,
+  environment: score.environment ?? "default",
+  long_string_value: score.long_string_value ?? "",
+  execution_trace_id: score.execution_trace_id,
+  event_ts: toClickhouseDateTimeString(score.event_ts) ?? "",
+  is_deleted: score.is_deleted ? 1 : 0,
+});
+
+const parseDateInput = (value: unknown) => {
+  if (value instanceof Date) return value;
+  if (typeof value === "number") return new Date(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return new Date(Number(value));
+  }
+  return new Date(String(value));
+};
+
+const normalizeTimestampColumn = (column: string) => {
+  const c = column.toLowerCase().replace(/\s+/g, "");
+  return c === "timestamp";
+};
+
+const SCORE_DATA_TYPE_VALUES = new Set([
+  "NUMERIC",
+  "BOOLEAN",
+  "CATEGORICAL",
+] as const);
+const toScoreDataTypeEnum = (value: unknown) => {
+  const normalized = String(value ?? "NUMERIC").toUpperCase();
+  return SCORE_DATA_TYPE_VALUES.has(normalized as any) ? normalized : "NUMERIC";
+};
 
 export const searchExistingAnnotationScore = async (
   projectId: string,
@@ -58,44 +162,26 @@ export const searchExistingAnnotationScore = async (
     throw new Error("Either name or configId (or both) must be provided.");
   }
 
-  const query = `
-    SELECT *
-    FROM scores s
-    WHERE s.project_id = {projectId: String}
-    AND s.source = 'ANNOTATION'
-    AND s.data_type = {dataType: String}
-    ${traceId ? `AND s.trace_id = {traceId: String}` : "AND isNull(s.trace_id)"}
-    ${observationId ? `AND s.observation_id = {observationId: String}` : "AND isNull(s.observation_id)"}
-    ${sessionId ? `AND s.session_id = {sessionId: String}` : "AND isNull(s.session_id)"}
-    AND (
-      FALSE
-      ${name ? `OR s.name = {name: String}` : ""}
-      ${configId ? `OR s.config_id = {configId: String}` : ""}
-    )
-    ORDER BY s.event_ts DESC
-    LIMIT 1 BY s.id, s.project_id
-    LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<ScoreRecordReadType>({
-    query,
-    params: {
-      projectId,
-      name,
-      configId,
-      traceId,
-      observationId,
-      sessionId,
-      dataType,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-  });
-  return rows.map((row) => convertClickhouseScoreToDomain(row)).shift();
+  const orConditions: Prisma.Sql[] = [];
+  if (name) orConditions.push(Prisma.sql`name = ${name}`);
+  if (configId) orConditions.push(Prisma.sql`config_id = ${configId}`);
+  const row = (
+    await prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT *
+      FROM scores
+      WHERE project_id = ${projectId}
+        AND source = 'ANNOTATION'
+        AND data_type::text = ${dataType}
+        ${traceId ? Prisma.sql`AND trace_id = ${traceId}` : Prisma.empty}
+        ${observationId ? Prisma.sql`AND observation_id = ${observationId}` : Prisma.empty}
+        AND (${Prisma.join(orConditions, " OR ")})
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `)
+  )[0];
+  return row
+    ? convertClickhouseScoreToDomain(toScoreRecordReadType(row))
+    : undefined;
 };
 
 export const getScoreById = async ({
@@ -120,13 +206,18 @@ export const getScoresByIds = async (
   scoreId: string[],
   source?: ScoreSourceType,
 ): Promise<ScoreDomain[]> => {
-  return _handleGetScoresByIds({
-    projectId,
-    scoreId,
-    source,
-    scoreScope: "all",
-    dataTypes: AGGREGATABLE_SCORE_TYPES,
-  });
+  const rows = await prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT *
+    FROM scores
+    WHERE project_id = ${projectId}
+      AND id IN (${Prisma.join(scoreId)})
+      ${source ? Prisma.sql`AND source = ${source}` : Prisma.empty}
+      AND data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    ORDER BY updated_at DESC
+  `);
+  return rows.map((row) =>
+    convertClickhouseScoreToDomain(toScoreRecordReadType(row)),
+  );
 };
 
 /**
@@ -137,17 +228,48 @@ export const upsertScore = async (score: Partial<ScoreRecordReadType>) => {
   if (!["id", "project_id", "name", "timestamp"].every((key) => key in score)) {
     throw new Error("Identifier fields must be provided to upsert Score.");
   }
-  await upsertClickhouse({
-    table: "scores",
-    records: [score as ScoreRecordReadType],
-    eventBodyMapper: convertClickhouseScoreToDomain,
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "upsert",
-      projectId: score.project_id ?? "",
-    },
-  });
+  const timestamp = parseDateInput(score.timestamp);
+  const dataType = toScoreDataTypeEnum(score.data_type);
+
+  const createdAt = score.created_at
+    ? parseDateInput(score.created_at)
+    : timestamp;
+  const updatedAt = score.updated_at
+    ? parseDateInput(score.updated_at)
+    : timestamp;
+  await prisma.$executeRaw`
+    DELETE FROM scores
+    WHERE project_id = ${score.project_id as string}
+      AND id = ${score.id as string}
+  `;
+  await prisma.$executeRaw`
+    INSERT INTO scores (
+      id, project_id, trace_id, observation_id, config_id, environment, name, source,
+      value, string_value, data_type, comment, author_user_id, queue_id, metadata,
+      timestamp, created_at, updated_at, event_ts, is_deleted
+    ) VALUES (
+      ${score.id as string},
+      ${score.project_id as string},
+      ${score.trace_id ?? score.id ?? ""},
+      ${score.observation_id ?? null},
+      ${score.config_id ?? null},
+      ${score.environment ?? "default"},
+      ${score.name ?? ""},
+      ${(score.source ?? "API") as any},
+      ${score.value ?? null},
+      ${score.string_value ?? null},
+      ${dataType}::score_data_type,
+      ${score.comment ?? null},
+      ${score.author_user_id ?? null},
+      ${score.queue_id ?? null},
+      ${(score.metadata ?? {}) as any},
+      ${timestamp},
+      ${createdAt},
+      ${updatedAt},
+      ${updatedAt},
+      ${false}
+    )
+  `;
 };
 
 export type GetScoresForTracesProps<
@@ -191,20 +313,6 @@ type GetScoresForDatasetRunsProps<
   includeHasMetadata?: IncludeHasMetadata;
 };
 
-const formatMetadataSelect = (
-  excludeMetadata: boolean,
-  includeHasMetadata: boolean,
-) => {
-  return [
-    !excludeMetadata ? "*" : "* EXCEPT (metadata)",
-    includeHasMetadata
-      ? "length(mapKeys(s.metadata)) > 0 AS has_metadata"
-      : null,
-  ]
-    .filter((s) => s != null)
-    .join(", ");
-};
-
 export const getScoresForSessions = async <
   ExcludeMetadata extends boolean,
   IncludeHasMetadata extends boolean,
@@ -216,47 +324,49 @@ export const getScoresForSessions = async <
     sessionIds,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
   } = props;
 
-  const select = formatMetadataSelect(excludeMetadata, includeHasMetadata);
-
-  const query = `
-      select
-        ${select}
-      from scores s
-      WHERE s.project_id = {projectId: String}
-      AND s.session_id IN ({sessionIds: Array(String)})
-      AND s.data_type IN ({dataTypes: Array(String)})
-      ORDER BY s.event_ts DESC
-      LIMIT 1 BY s.id, s.project_id
-      ${limit && offset ? `limit {limit: Int32} offset {offset: Int32}` : ""}
-    `;
-
-  const rows = await queryClickhouse<ScoreRecordReadType>({
-    query: query,
-    params: {
-      projectId,
-      sessionIds,
-      limit,
-      offset,
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-    },
-    tags: {
-      feature: "sessions",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-    clickhouseConfigs,
-  });
+  const rowsRaw = await prisma.$queryRaw<
+    Array<Record<string, unknown>>
+  >(Prisma.sql`
+    WITH ranked AS (
+      SELECT
+        s.*,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
+        ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
+      FROM scores s
+      WHERE s.project_id = ${projectId}
+        AND s.session_id IN (${Prisma.join(sessionIds)})
+        AND s.data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY event_ts DESC
+    ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+    ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+  `);
 
   const includeMetadataPayload = excludeMetadata ? false : true;
-  return rows.map((row) =>
-    convertClickhouseScoreToDomain(row, includeMetadataPayload),
-  );
+  return rowsRaw.map((row) => {
+    const mapped = toScoreRecordReadType(row as any);
+    const score = convertClickhouseScoreToDomain(
+      {
+        ...mapped,
+        metadata: excludeMetadata ? {} : mapped.metadata,
+      },
+      includeMetadataPayload,
+    );
+    if (includeHasMetadata) {
+      Object.assign(score, {
+        hasMetadata: !!(row.has_metadata as number | undefined),
+      });
+    }
+    return score;
+  });
 };
 
 export const getScoresForDatasetRuns = async <
@@ -270,50 +380,52 @@ export const getScoresForDatasetRuns = async <
     runIds,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
   } = props;
 
-  const select = formatMetadataSelect(excludeMetadata, includeHasMetadata);
-
-  const query = `
-      select
-        ${select}
-      from scores s
-      WHERE s.project_id = {projectId: String}
-      AND s.dataset_run_id IN ({runIds: Array(String)})
-      AND s.data_type IN ({dataTypes: Array(String)})
-      ORDER BY s.event_ts DESC
-      LIMIT 1 BY s.id, s.project_id
-      ${limit && offset ? `limit {limit: Int32} offset {offset: Int32}` : ""}
-    `;
-
-  const rows = await queryClickhouse<ScoreRecordReadType>({
-    query: query,
-    params: {
-      projectId,
-      runIds,
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-      limit,
-      offset,
-    },
-    tags: {
-      feature: "sessions",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-    clickhouseConfigs,
-  });
+  const rowsRaw = await prisma.$queryRaw<
+    Array<Record<string, unknown>>
+  >(Prisma.sql`
+    WITH ranked AS (
+      SELECT
+        s.*,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
+        ROW_NUMBER() OVER (PARTITION BY s.id, s.project_id ORDER BY s.event_ts DESC) AS rn
+      FROM scores s
+      WHERE s.project_id = ${projectId}
+        AND s.dataset_run_id IN (${Prisma.join(runIds)})
+        AND s.data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY event_ts DESC
+    ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+    ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+  `);
 
   const includeMetadataPayload = excludeMetadata ? false : true;
-  return rows.map((row) =>
-    convertClickhouseScoreToDomain<ExcludeMetadata, AggregatableScoreDataType>(
-      row,
+  return rowsRaw.map((row) => {
+    const mapped = toScoreRecordReadType(row as any);
+    const score = convertClickhouseScoreToDomain<
+      ExcludeMetadata,
+      AggregatableScoreDataType
+    >(
+      {
+        ...mapped,
+        metadata: excludeMetadata ? {} : mapped.metadata,
+      },
       includeMetadataPayload,
-    ),
-  );
+    );
+    if (includeHasMetadata) {
+      Object.assign(score, {
+        hasMetadata: !!(row.has_metadata as number | undefined),
+      });
+    }
+    return score;
+  });
 };
 
 export const getTraceScoresForDatasetRuns = async (
@@ -322,70 +434,38 @@ export const getTraceScoresForDatasetRuns = async (
 ): Promise<Array<{ dataset_run_id: string } & any>> => {
   if (datasetRunIds.length === 0) return [];
 
-  const query = `
-    SELECT
-      s.id as id,
-      s.timestamp as timestamp,
-      s.project_id as project_id,
-      s.environment as environment,
-      s.trace_id as trace_id,
-      s.session_id as session_id,
-      s.observation_id as observation_id,
-      s.dataset_run_id as dataset_run_id,
-      s.name as name,
-      s.value as value,
-      s.source as source,
-      s.comment as comment,
-      s.author_user_id as author_user_id,
-      s.config_id as config_id,
-      s.data_type as data_type,
-      s.string_value as string_value,
-      s.queue_id as queue_id,
-      s.execution_trace_id as execution_trace_id,
-      s.created_at as created_at,
-      s.updated_at as updated_at,
-      s.event_ts as event_ts,
-      s.is_deleted as is_deleted,
-      length(mapKeys(s.metadata)) > 0 AS has_metadata,
-      dri.dataset_run_id as run_id
-    FROM dataset_run_items_rmt dri
-    JOIN scores s FINAL ON dri.trace_id = s.trace_id
-      AND dri.project_id = s.project_id
-    WHERE dri.project_id = {projectId: String}
-      AND dri.dataset_run_id IN {datasetRunIds: Array(String)}
-      AND s.project_id = {projectId: String}
-      AND s.data_type IN ({dataTypes: Array(String)})
-    ORDER BY s.event_ts DESC
-    LIMIT 1 BY s.id, s.project_id, dri.dataset_run_id
-  `;
-
-  const rows = await queryClickhouse<
-    Omit<ScoreRecordReadType, "metadata"> & {
-      has_metadata: 0 | 1;
-      run_id: string;
-    }
-  >({
-    query,
-    params: {
-      projectId,
-      datasetRunIds,
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-    },
-    tags: {
-      feature: "dataset-run-items",
-      type: "trace-scores",
-      kind: "list",
-      projectId,
-    },
-  });
+  const rows = await prisma.$queryRaw<
+    Array<Record<string, unknown> & { has_metadata: 0 | 1; run_id: string }>
+  >(Prisma.sql`
+    WITH ranked AS (
+      SELECT
+        s.*,
+        CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END AS has_metadata,
+        dri.dataset_run_id as run_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY s.id, s.project_id, dri.dataset_run_id
+          ORDER BY s.event_ts DESC
+        ) AS rn
+      FROM dataset_run_items dri
+      JOIN scores s ON dri.trace_id = s.trace_id AND dri.project_id = s.project_id
+      WHERE dri.project_id = ${projectId}
+        AND dri.dataset_run_id IN (${Prisma.join(datasetRunIds)})
+        AND s.project_id = ${projectId}
+        AND s.data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY event_ts DESC
+  `);
 
   const includeMetadataPayload = false;
   return rows.map((row) => ({
     ...convertClickhouseScoreToDomain(
-      { ...row, metadata: {} },
+      { ...toScoreRecordReadType(row as any), metadata: {} },
       includeMetadataPayload,
     ),
-    datasetRunId: row.run_id,
+    datasetRunId: row.run_id as string,
     hasMetadata: !!row.has_metadata,
   }));
 };
@@ -406,56 +486,44 @@ const getScoresForTracesInternal = async <
     dataTypes,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
-    preferredClickhouseService,
+    preferredClickhouseService: _preferredClickhouseService,
   } = props;
 
-  const select = formatMetadataSelect(excludeMetadata, includeHasMetadata);
-
-  const query = `
-      select
-        ${select}
-      from scores s
-      WHERE s.project_id = {projectId: String}
-      AND s.trace_id IN ({traceIds: Array(String)})
-      ${dataTypes ? `AND s.data_type IN ({dataTypes: Array(String)})` : ""}
-      ${timestamp ? `AND s.timestamp >= {traceTimestamp: DateTime64(3)} - ${SCORE_TO_TRACE_OBSERVATIONS_INTERVAL}` : ""}
-      ORDER BY s.event_ts DESC
-      LIMIT 1 BY s.id, s.project_id
-      ${limit && offset ? `limit {limit: Int32} offset {offset: Int32}` : ""}
-    `;
-
-  const rows = await queryClickhouse<
-    ScoreRecordReadType & {
-      metadata: ExcludeMetadata extends true
-        ? never
-        : ScoreRecordReadType["metadata"];
-      // has_metadata is 0 or 1 from ClickHouse, later converted to a boolean
-      has_metadata: IncludeHasMetadata extends true ? 0 | 1 : never;
-    }
-  >({
-    query: query,
-    params: {
-      projectId,
-      traceIds,
-      limit,
-      offset,
-      ...(dataTypes ? { dataTypes: dataTypes.map((d) => d.toString()) } : {}),
-      ...(timestamp
-        ? { traceTimestamp: convertDateToClickhouseDateTime(timestamp) }
-        : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-    clickhouseConfigs,
-    preferredClickhouseService,
-  });
+  const tsLowerBound = timestamp
+    ? new Date(timestamp.getTime() - 2 * 24 * 60 * 60 * 1000)
+    : null;
+  const pagination = Prisma.sql`
+    ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+    ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+  `;
+  const rowsRaw = await prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT *
+    FROM scores
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
+      ${dataTypes ? Prisma.sql`AND data_type::text IN (${Prisma.join(dataTypes as unknown as string[])})` : Prisma.empty}
+      ${tsLowerBound ? Prisma.sql`AND timestamp >= ${tsLowerBound}` : Prisma.empty}
+    ORDER BY updated_at DESC
+    ${pagination}
+  `);
+  const rows = rowsRaw.map((row) => ({
+    ...toScoreRecordReadType(row),
+    metadata: excludeMetadata
+      ? ({} as ExcludeMetadata extends true
+          ? never
+          : ScoreRecordReadType["metadata"])
+      : (toClickhouseMetadataRecord(
+          row.metadata,
+        ) as ExcludeMetadata extends true
+          ? never
+          : ScoreRecordReadType["metadata"]),
+    has_metadata: (jsonbHasAnyKeys(row.metadata)
+      ? 1
+      : 0) as unknown as IncludeHasMetadata extends true ? 0 | 1 : never,
+  }));
 
   const includeMetadataPayload = excludeMetadata ? false : true;
   return rows.map((row) => {
@@ -532,57 +600,47 @@ export const getScoresForObservations = async <
     observationIds,
     limit,
     offset,
-    clickhouseConfigs,
+    clickhouseConfigs: _clickhouseConfigs,
     excludeMetadata = false,
     includeHasMetadata = false,
   } = props;
 
-  const select = [
-    !excludeMetadata ? "*" : "* EXCEPT (metadata)",
-    includeHasMetadata
-      ? "length(mapKeys(s.metadata)) > 0 AS has_metadata"
-      : null,
-  ]
-    .filter((s) => s != null)
-    .join(", ");
+  const rowsRaw = await prisma.$queryRaw<
+    Array<
+      {
+        has_metadata: IncludeHasMetadata extends true ? 0 | 1 : never;
+      } & Record<string, unknown>
+    >
+  >(Prisma.sql`
+    SELECT
+      s.*,
+      ${
+        includeHasMetadata
+          ? Prisma.sql`CASE WHEN EXISTS (SELECT 1 FROM jsonb_object_keys(COALESCE(s.metadata, '{}'::jsonb))) THEN 1 ELSE 0 END`
+          : Prisma.sql`0`
+      } AS has_metadata
+    FROM scores s
+    WHERE s.project_id = ${projectId}
+      AND s.observation_id IN (${Prisma.join(observationIds)})
+      AND s.data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    ORDER BY s.event_ts DESC
+    ${limit !== undefined ? Prisma.sql`LIMIT ${limit}` : Prisma.empty}
+    ${offset !== undefined ? Prisma.sql`OFFSET ${offset}` : Prisma.empty}
+  `);
 
-  const query = `
-      select
-        ${select}
-      from scores s
-      WHERE s.project_id = {projectId: String}
-      AND s.observation_id IN ({observationIds: Array(String)})
-      AND s.data_type IN ({dataTypes: Array(String)})
-      ORDER BY s.event_ts DESC
-      LIMIT 1 BY s.id, s.project_id
-      ${limit !== undefined && offset !== undefined ? `limit {limit: Int32} offset {offset: Int32}` : ""}
-    `;
-
-  const rows = await queryClickhouse<
-    ScoreRecordReadType & {
-      metadata: ExcludeMetadata extends true
-        ? never
-        : ScoreRecordReadType["metadata"];
-      // has_metadata is 0 or 1 from ClickHouse, later converted to a boolean
-      has_metadata: IncludeHasMetadata extends true ? 0 | 1 : never;
-    }
-  >({
-    query: query,
-    params: {
-      projectId: projectId,
-      observationIds: observationIds,
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-      limit: limit,
-      offset: offset,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-    clickhouseConfigs,
-  });
+  const rows = rowsRaw.map((row) => ({
+    ...toScoreRecordReadType(row as any),
+    metadata: (excludeMetadata
+      ? {}
+      : toClickhouseMetadataRecord(
+          (row as any).metadata,
+        )) as ExcludeMetadata extends true
+      ? never
+      : ScoreRecordReadType["metadata"],
+    has_metadata: (row.has_metadata ?? 0) as IncludeHasMetadata extends true
+      ? 0 | 1
+      : never,
+  }));
 
   const includeMetadataPayload = excludeMetadata ? false : true;
   return rows.map((row) => ({
@@ -601,7 +659,7 @@ export const getScoresForObservations = async <
 
 export const getScoresGroupedByNameSourceType = async ({
   projectId,
-  filter,
+  filter: _filter,
   fromTimestamp,
   toTimestamp,
 }: {
@@ -610,64 +668,26 @@ export const getScoresGroupedByNameSourceType = async ({
   fromTimestamp?: Date;
   toTimestamp?: Date;
 }) => {
-  const scoresFilter = new FilterList();
-  scoresFilter.push(
-    ...createFilterFromFilterState(
-      filter,
-      scoresColumnsTableUiColumnDefinitions,
-    ),
-  );
-  const scoresFilterRes = scoresFilter.apply();
-
-  // Only join dataset run items and traces if there is a dataset run items filter
-  const performDatasetRunItemsAndTracesJoin = scoresFilter.some(
-    (f) => f.clickhouseTable === "dataset_run_items_rmt",
-  );
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-
-  const query = `
-    select
+  const rows = await prisma.$queryRaw<
+    {
+      name: string;
+      source: string;
+      data_type: string;
+    }[]
+  >(Prisma.sql`
+    SELECT
       s.name as name,
       s.source as source,
-      s.data_type as data_type
+      s.data_type::text as data_type
     FROM scores s
-    ${performDatasetRunItemsAndTracesJoin ? `JOIN dataset_run_items_rmt dri ON s.trace_id = dri.trace_id AND s.project_id = dri.project_id` : ""}
-    WHERE s.project_id = {projectId: String}
-    ${scoresFilterRes?.query ? `AND ${scoresFilterRes.query}` : ""}
-    ${fromTimestamp ? `AND s.timestamp >= {fromTimestamp: DateTime64(3)}` : ""}
-    ${toTimestamp ? `AND s.timestamp <= {toTimestamp: DateTime64(3)}` : ""}
-    AND s.data_type IN ({dataTypes: Array(String)})
-    GROUP BY name, source, data_type
-    ORDER BY count() desc
-    LIMIT 1000;
-  `;
-
-  const rows = await queryClickhouse<{
-    name: string;
-    source: string;
-    data_type: string;
-  }>({
-    query: query,
-    params: {
-      projectId: projectId,
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-      ...(fromTimestamp
-        ? { fromTimestamp: convertDateToClickhouseDateTime(fromTimestamp) }
-        : {}),
-      ...(toTimestamp
-        ? { toTimestamp: convertDateToClickhouseDateTime(toTimestamp) }
-        : {}),
-      ...(scoresFilterRes ? scoresFilterRes.params : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-  });
+    WHERE s.project_id = ${projectId}
+      ${fromTimestamp ? Prisma.sql`AND s.timestamp >= ${fromTimestamp}` : Prisma.empty}
+      ${toTimestamp ? Prisma.sql`AND s.timestamp <= ${toTimestamp}` : Prisma.empty}
+      AND s.data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    GROUP BY s.name, s.source, s.data_type
+    ORDER BY COUNT(*) DESC
+    LIMIT 1000
+  `);
 
   return rows.map((row) => ({
     name: row.name,
@@ -680,155 +700,127 @@ export const getNumericScoresGroupedByName = async (
   projectId: string,
   timestampFilter?: FilterState,
 ) => {
-  const chFilter = timestampFilter
-    ? createFilterFromFilterState(timestampFilter, [
-        {
-          uiTableName: "Timestamp",
-          uiTableId: "timestamp",
-          clickhouseTableName: "scores",
-          clickhouseSelect: "timestamp",
-        },
-      ])
-    : undefined;
-
-  const timestampFilterRes = chFilter
-    ? new FilterList(chFilter).apply()
-    : undefined;
-
-  // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
-  const query = `
-      select
-        name as name
-      from scores s
-      WHERE s.project_id = {projectId: String}
-      AND has(['NUMERIC', 'BOOLEAN'], s.data_type)
-      ${timestampFilterRes?.query ? `AND ${timestampFilterRes.query}` : ""}
-      GROUP BY name
-      ORDER BY count() desc
-      LIMIT 1000;
-    `;
-
-  const rows = await queryClickhouse<{
-    name: string;
-  }>({
-    query: query,
-    params: {
-      projectId: projectId,
-      ...(timestampFilterRes ? timestampFilterRes.params : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-  });
-
-  return rows;
+  try {
+    const timeConditions = (timestampFilter ?? [])
+      .filter(
+        (f) => f.type === "datetime" && normalizeTimestampColumn(f.column),
+      )
+      .map((f) => {
+        if (f.operator === ">=") return Prisma.sql`s.timestamp >= ${f.value}`;
+        if (f.operator === ">") return Prisma.sql`s.timestamp > ${f.value}`;
+        if (f.operator === "<=") return Prisma.sql`s.timestamp <= ${f.value}`;
+        return Prisma.sql`s.timestamp < ${f.value}`;
+      });
+    return prisma.$queryRaw<Array<{ name: string }>>(Prisma.sql`
+      SELECT s.name as name
+      FROM scores s
+      WHERE s.project_id = ${projectId}
+        AND s.data_type::text IN ('NUMERIC','BOOLEAN')
+        ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
+      GROUP BY s.name
+      ORDER BY COUNT(*) DESC
+      LIMIT 1000
+    `);
+  } catch (error) {
+    logger.error(
+      `getNumericScoresGroupedByName failed; projectId=${projectId}; timestampFilterCount=${timestampFilter?.length ?? 0}; error=${stringifyErrorForMessage(error)}`,
+    );
+    throw error;
+  }
 };
 
 export const getCategoricalScoresGroupedByName = async (
   projectId: string,
   timestampFilter?: FilterState,
 ) => {
-  const chFilter = timestampFilter
-    ? createFilterFromFilterState(timestampFilter, [
-        {
-          uiTableName: "Timestamp",
-          uiTableId: "timestamp",
-          clickhouseTableName: "scores",
-          clickhouseSelect: "timestamp",
-        },
-      ])
-    : undefined;
+  try {
+    const timeConditions = (timestampFilter ?? [])
+      .filter(
+        (f) => f.type === "datetime" && normalizeTimestampColumn(f.column),
+      )
+      .map((f) => {
+        if (f.operator === ">=") return Prisma.sql`s.timestamp >= ${f.value}`;
+        if (f.operator === ">") return Prisma.sql`s.timestamp > ${f.value}`;
+        if (f.operator === "<=") return Prisma.sql`s.timestamp <= ${f.value}`;
+        return Prisma.sql`s.timestamp < ${f.value}`;
+      });
 
-  const timestampFilterRes = chFilter
-    ? new FilterList(chFilter).apply()
-    : undefined;
+    const rows = await prisma.$queryRaw<
+      {
+        label: string;
+        values: string[];
+      }[]
+    >(Prisma.sql`
+      SELECT
+        s.name AS label,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.string_value), NULL) AS values
+      FROM scores s
+      WHERE s.project_id = ${projectId}
+        AND s.data_type::text = 'CATEGORICAL'
+        ${timeConditions.length ? Prisma.sql`AND ${Prisma.join(timeConditions, " AND ")}` : Prisma.empty}
+      GROUP BY s.name
+      ORDER BY COUNT(*) DESC
+      LIMIT 1000
+    `);
 
-  const query = `
-    SELECT
-      name AS label,
-      groupArray(DISTINCT string_value) AS values
-    FROM scores s
-    WHERE s.project_id = {projectId: String}
-    AND s.data_type = 'CATEGORICAL'
-    ${timestampFilterRes?.query ? `AND ${timestampFilterRes.query}` : ""}
-    GROUP BY name
-    ORDER BY count() DESC
-    LIMIT 1000;
-  `;
+    // Get score names from ClickHouse results to query score configs
+    const scoreNames = rows.map((row) => row.label);
 
-  const rows = await queryClickhouse<{
-    label: string;
-    values: string[];
-  }>({
-    query: query,
-    params: {
-      projectId: projectId,
-      ...(timestampFilterRes ? timestampFilterRes.params : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "list",
-      projectId,
-    },
-  });
-
-  // Get score names from ClickHouse results to query score configs
-  const scoreNames = rows.map((row) => row.label);
-
-  // Query score_configs table for categorical configurations
-  const scoreConfigs =
-    scoreNames.length > 0
-      ? await prisma.scoreConfig.findMany({
-          where: {
-            projectId: projectId,
-            name: {
-              in: scoreNames,
+    // Query score_configs table for categorical configurations
+    const scoreConfigs =
+      scoreNames.length > 0
+        ? await metadataPrisma.scoreConfig.findMany({
+            where: {
+              projectId: projectId,
+              name: {
+                in: scoreNames,
+              },
+              dataType: "CATEGORICAL",
+              isArchived: false,
             },
-            dataType: "CATEGORICAL",
-            isArchived: false,
-          },
-          select: {
-            name: true,
-            categories: true,
-          },
-        })
-      : [];
+            select: {
+              name: true,
+              categories: true,
+            },
+          })
+        : [];
 
-  // Create a map of score configs for easy lookup
-  const configMap = new Map(
-    scoreConfigs.map((config) => [config.name, config.categories]),
-  );
+    // Create a map of score configs for easy lookup
+    const configMap = new Map(
+      scoreConfigs.map((config) => [config.name, config.categories]),
+    );
 
-  // Enhance the results with all possible category values from score configs
-  return rows.map((row) => {
-    const configCategories = configMap.get(row.label);
+    // Enhance the results with all possible category values from score configs
+    return rows.map((row) => {
+      const configCategories = configMap.get(row.label);
 
-    if (configCategories && Array.isArray(configCategories)) {
-      // Extract all possible category labels from the score config
-      const allPossibleValues = (
-        configCategories as Array<{ label: string; value: number }>
-      ).map((category) => category.label);
+      if (configCategories && Array.isArray(configCategories)) {
+        // Extract all possible category labels from the score config
+        const allPossibleValues = (
+          configCategories as Array<{ label: string; value: number }>
+        ).map((category) => category.label);
 
-      // Merge actual values from ClickHouse with all possible values from config
-      // Use Set to ensure uniqueness
-      const mergedValues = Array.from(
-        new Set([...row.values, ...allPossibleValues]),
-      );
+        // Merge actual values from ClickHouse with all possible values from config
+        // Use Set to ensure uniqueness
+        const mergedValues = Array.from(
+          new Set([...row.values, ...allPossibleValues]),
+        );
 
-      return {
-        ...row,
-        values: mergedValues,
-      };
-    }
+        return {
+          ...row,
+          values: mergedValues,
+        };
+      }
 
-    // If no config found, return original values
-    return row;
-  });
+      // If no config found, return original values
+      return row;
+    });
+  } catch (error) {
+    logger.error(
+      `getCategoricalScoresGroupedByName failed; projectId=${projectId}; timestampFilterCount=${timestampFilter?.length ?? 0}; error=${stringifyErrorForMessage(error)}`,
+    );
+    throw error;
+  }
 };
 
 export const getScoresUiCount = async (props: {
@@ -1013,7 +1005,7 @@ const getScoresUiGeneric = async <T>(props: {
   const query = `
       SELECT
           ${select}
-      FROM scores s final
+      FROM scores s
       ${performTracesJoin ? "LEFT JOIN traces t ON s.trace_id = t.id AND t.project_id = s.project_id" : ""}
       WHERE s.project_id = {projectId: String}
       AND s.data_type IN ({dataTypes: Array(String)})
@@ -1215,7 +1207,7 @@ const getScoresUiGenericFromEvents = async <T>(props: {
       ${tracesCTEClause}
       SELECT
           ${select}
-      FROM scores s final
+      FROM scores s
       ${eventsJoin}
       WHERE s.project_id = {projectId: String}
       AND s.data_type IN ({dataTypes: Array(String)})
@@ -1349,7 +1341,7 @@ export const getScoreNames = async (
   const timestampFilterRes = chFilter.apply();
 
   // We mainly use queries like this to retrieve filter options.
-  // Therefore, we can skip final as some inaccuracy in count is acceptable.
+  // This endpoint is filter-options focused; minor count approximation is acceptable.
   const query = `
       select
         name,
@@ -1437,54 +1429,24 @@ export const getScoreStringValues = async (
 };
 
 export const deleteScores = async (projectId: string, scoreIds: string[]) => {
-  const query = `
+  if (scoreIds.length === 0) return;
+  await prisma.$executeRaw`
     DELETE FROM scores
-    WHERE project_id = {projectId: String}
-    AND id in ({scoreIds: Array(String)});
+    WHERE project_id = ${projectId}
+      AND id IN (${Prisma.join(scoreIds)})
   `;
-  await commandClickhouse({
-    query: query,
-    params: {
-      projectId,
-      scoreIds,
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "delete",
-      projectId,
-    },
-  });
 };
 
 export const deleteScoresByTraceIds = async (
   projectId: string,
   traceIds: string[],
 ) => {
-  const query = `
+  if (traceIds.length === 0) return;
+  await prisma.$executeRaw`
     DELETE FROM scores
-    WHERE project_id = {projectId: String}
-    AND trace_id IN ({traceIds: Array(String)});
+    WHERE project_id = ${projectId}
+      AND trace_id IN (${Prisma.join(traceIds)})
   `;
-  await commandClickhouse({
-    query: query,
-    params: {
-      projectId,
-      traceIds,
-    },
-    clickhouseConfigs: {
-      request_timeout: 120_000, // 2 minutes
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "delete",
-      projectId,
-    },
-  });
 };
 
 export const deleteScoresByProjectId = async (
@@ -1495,25 +1457,10 @@ export const deleteScoresByProjectId = async (
     return false;
   }
 
-  const query = `
+  await prisma.$executeRaw`
     DELETE FROM scores
-    WHERE project_id = {projectId: String};
+    WHERE project_id = ${projectId}
   `;
-  const tags = {
-    feature: "tracing",
-    type: "score",
-    kind: "delete",
-    projectId,
-  };
-
-  await commandClickhouse({
-    query,
-    params: { projectId },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags,
-  });
 
   return true;
 };
@@ -1522,27 +1469,13 @@ export const hasAnyScoreOlderThan = async (
   projectId: string,
   beforeDate: Date,
 ) => {
-  const query = `
-    SELECT 1
+  const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+    SELECT 1 as one
     FROM scores
-    WHERE project_id = {projectId: String}
-    AND timestamp < {cutoffDate: DateTime64(3)}
+    WHERE project_id = ${projectId}
+      AND timestamp < ${beforeDate}
     LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<{ 1: number }>({
-    query,
-    params: {
-      projectId,
-      cutoffDate: convertDateToClickhouseDateTime(beforeDate),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "hasAnyOlderThan",
-      projectId,
-    },
-  });
+  `);
 
   return rows.length > 0;
 };
@@ -1556,27 +1489,11 @@ export const deleteScoresOlderThanDays = async (
     return false;
   }
 
-  const query = `
+  await prisma.$executeRaw`
     DELETE FROM scores
-    WHERE project_id = {projectId: String}
-    AND timestamp < {cutoffDate: DateTime64(3)};
+    WHERE project_id = ${projectId}
+      AND timestamp < ${beforeDate}
   `;
-  await commandClickhouse({
-    query: query,
-    params: {
-      projectId,
-      cutoffDate: convertDateToClickhouseDateTime(beforeDate),
-    },
-    clickhouseConfigs: {
-      request_timeout: env.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "delete",
-      projectId,
-    },
-  });
 
   return true;
 };
@@ -1649,7 +1566,7 @@ export const getAggregatedScoresForPrompts = async (
       s.comment,
       s.timestamp,
       length(mapKeys(s.metadata)) > 0 AS has_metadata
-    FROM scores s FINAL LEFT JOIN observations o FINAL
+    FROM scores s LEFT JOIN observations o
       ON o.trace_id = s.trace_id
       AND o.project_id = s.project_id
       ${fetchScoreRelation === "observation" ? "AND o.id = s.observation_id" : ""}
@@ -1697,30 +1614,18 @@ export const getScoreCountsByProjectInCreationInterval = async ({
   start: Date;
   end: Date;
 }) => {
-  const query = `
-    SELECT
-      project_id,
-      count(*) as count
-    FROM scores
-    WHERE created_at >= {start: DateTime64(3)}
-    AND created_at < {end: DateTime64(3)}
-    AND data_type IN ({dataTypes: Array(String)})
-    GROUP BY project_id
-  `;
-
-  const rows = await queryClickhouse<{ project_id: string; count: string }>({
-    query,
-    params: {
-      start: convertDateToClickhouseDateTime(start),
-      end: convertDateToClickhouseDateTime(end),
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "analytic",
-    },
-  });
+  const rows = await prisma.$queryRaw<
+    Array<{ project_id: string; count: bigint }>
+  >(
+    Prisma.sql`
+      SELECT project_id, count(*)::bigint as count
+      FROM scores
+      WHERE created_at >= ${start}
+        AND created_at < ${end}
+        AND data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+      GROUP BY project_id
+    `,
+  );
 
   return rows.map((row) => ({
     projectId: row.project_id,
@@ -1735,28 +1640,16 @@ export const getScoreCountOfProjectsSinceCreationDate = async ({
   projectIds: string[];
   start: Date;
 }) => {
-  const query = `
-    SELECT
-      count(*) as count
+  if (projectIds.length === 0) return 0;
+
+  const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT count(*)::bigint as count
     FROM scores
-    WHERE project_id IN ({projectIds: Array(String)})
-    AND created_at >= {start: DateTime64(3)}
-  `;
+    WHERE project_id IN (${Prisma.join(projectIds)})
+      AND created_at >= ${start}
+  `);
 
-  const rows = await queryClickhouse<{ count: string }>({
-    query,
-    params: {
-      projectIds,
-      start: convertDateToClickhouseDateTime(start),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "analytic",
-    },
-  });
-
-  return Number(rows[0]?.count ?? 0);
+  return Number(rows[0]?.count ?? 0n);
 };
 
 export const getDistinctScoreNames = async (p: {
@@ -1829,7 +1722,7 @@ export const getScoresForBlobStorageExport = function (
       comment,
       data_type,
       string_value
-    FROM scores FINAL
+    FROM scores
     WHERE project_id = {projectId: String}
     AND timestamp >= {minTimestamp: DateTime64(3)}
     AND timestamp <= {maxTimestamp: DateTime64(3)}
@@ -1888,8 +1781,8 @@ export const getScoresForAnalyticsIntegrations = async function* (
       s.metadata as metadata,
       t.metadata['$posthog_session_id'] as posthog_session_id,
       t.metadata['$mixpanel_session_id'] as mixpanel_session_id
-    FROM scores s FINAL
-    LEFT JOIN ${traceTable} t FINAL ON s.trace_id = t.id AND s.project_id = t.project_id
+    FROM scores s
+    LEFT JOIN ${traceTable} t ON s.trace_id = t.id AND s.project_id = t.project_id
     WHERE s.project_id = {projectId: String}
     AND s.timestamp >= {minTimestamp: DateTime64(3)}
     AND s.timestamp <= {maxTimestamp: DateTime64(3)}
@@ -1978,24 +1871,12 @@ export const getScoresForAnalyticsIntegrations = async function* (
 };
 
 export const hasAnyScore = async (projectId: string) => {
-  const query = `    SELECT 1
+  const rows = await prisma.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+    SELECT 1 as one
     FROM scores
-    WHERE project_id = {projectId: String}
+    WHERE project_id = ${projectId}
     LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<{ 1: number }>({
-    query,
-    params: {
-      projectId,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "hasAny",
-      projectId,
-    },
-  });
+  `);
 
   return rows.length > 0;
 };
@@ -2005,35 +1886,24 @@ export const getScoreMetadataById = async (
   id: string,
   source?: ScoreSourceType,
 ) => {
-  const query = `    SELECT
-      metadata
-    FROM scores s
-    WHERE s.project_id = {projectId: String}
-    AND s.id = {id: String}
-    ${source ? `AND s.source = {source: String}` : ""}
-    ORDER BY s.event_ts DESC
-    LIMIT 1 BY s.id, s.project_id
-    LIMIT 1
-  `;
-
-  const rows = await queryClickhouse<Pick<ScoreRecordReadType, "metadata">>({
-    query,
-    params: {
-      projectId,
-      id,
-      ...(source !== undefined ? { source } : {}),
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "getScoreMetadataById",
-      projectId,
-    },
-  });
+  const rows = await prisma.$queryRaw<
+    Array<{ metadata: Record<string, unknown> | null }>
+  >(
+    Prisma.sql`
+      SELECT DISTINCT ON (s.id, s.project_id)
+        s.metadata
+      FROM scores s
+      WHERE s.project_id = ${projectId}
+        AND s.id = ${id}
+        ${source ? Prisma.sql`AND s.source = ${source}` : Prisma.empty}
+      ORDER BY s.id, s.project_id, s.event_ts DESC
+      LIMIT 1
+    `,
+  );
 
   return rows
     .map((row) =>
-      parseMetadataCHRecordToDomain(row.metadata as Record<string, string>),
+      parseMetadataCHRecordToDomain(toClickhouseMetadataRecord(row.metadata)),
     )
     .shift();
 };
@@ -2055,7 +1925,7 @@ export const getScoreMetadataById = async (
  *   endDate: new Date('2024-03-03T00:00:00Z')
  * });
  *
- * Note: Skips using FINAL (double counting risk) for faster and cheaper
+ * Note: Uses non-deduplicating reads for faster and cheaper queries.
  * queries against clickhouse. Generous 4x overcompensation before blocking allows
  * for usage aggregation to be meaningful.
  *
@@ -2067,35 +1937,19 @@ export const getScoreCountsByProjectAndDay = async ({
   startDate: Date;
   endDate: Date;
 }) => {
-  const query = `
+  const rows = await prisma.$queryRaw<
+    Array<{ count: bigint; project_id: string; date: string }>
+  >(Prisma.sql`
     SELECT
-      count(*) as count,
+      count(*)::bigint as count,
       project_id,
-      toDate(timestamp) as date
+      DATE(timestamp)::text as date
     FROM scores
-    WHERE timestamp >= {startDate: DateTime64(3)}
-    AND timestamp < {endDate: DateTime64(3)}
-    AND data_type IN ({dataTypes: Array(String)})
-    GROUP BY project_id, toDate(timestamp)
-  `;
-
-  const rows = await queryClickhouse<{
-    count: string;
-    project_id: string;
-    date: string;
-  }>({
-    query,
-    params: {
-      startDate: convertDateToClickhouseDateTime(startDate),
-      endDate: convertDateToClickhouseDateTime(endDate),
-      dataTypes: AGGREGATABLE_SCORE_TYPES,
-    },
-    tags: {
-      feature: "tracing",
-      type: "score",
-      kind: "analytic",
-    },
-  });
+    WHERE timestamp >= ${startDate}
+      AND timestamp < ${endDate}
+      AND data_type::text IN (${Prisma.join(AGGREGATABLE_SCORE_TYPES as unknown as string[])})
+    GROUP BY project_id, DATE(timestamp)
+  `);
 
   return rows.map((row) => ({
     count: Number(row.count),

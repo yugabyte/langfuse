@@ -99,9 +99,9 @@ function TablePeekViewComponent(props: TablePeekViewProps) {
   return (
     <Sheet open={!!itemId} onOpenChange={handleOpenChange} modal={false}>
       <SheetContent
-        onPointerDownOutside={(e) => {
-          // Prevent the default behavior of closing when clicking outside when we set modal={false}
-          e.preventDefault();
+        onPointerDownOutside={() => {
+          if (eventHandler()) return;
+          peekView.closePeek();
         }}
         side="right"
         className="flex max-h-full min-h-0 min-w-[60vw] flex-col gap-0 overflow-hidden p-0"

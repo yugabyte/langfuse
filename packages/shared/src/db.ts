@@ -27,11 +27,29 @@ export class PrismaClientSingleton {
   }
 }
 
-const createPrismaInstance = () => {
+export class PrismaTracingClientSingleton {
+  private static instance: PrismaClient;
+
+  public static getInstance(): PrismaClient {
+    if (PrismaTracingClientSingleton.instance) {
+      return PrismaTracingClientSingleton.instance;
+    }
+
+    PrismaTracingClientSingleton.instance = createPrismaInstance({
+      url: process.env.TRACING_DATABASE_URL, // eslint-disable-line turbo/no-undeclared-env-vars
+    });
+
+    return PrismaTracingClientSingleton.instance;
+  }
+}
+
+const createPrismaInstance = (params?: { url?: string }) => {
+  const datasources = params?.url ? { db: { url: params.url } } : undefined;
   const client = new PrismaClient<
     Prisma.PrismaClientOptions,
     "warn" | "error" | "query"
   >({
+    datasources,
     log: [
       { emit: "event", level: "query" },
       { emit: "event", level: "error" },
@@ -85,12 +103,16 @@ export class KyselySingleton {
 
 declare const globalThis: {
   prismaGlobal: PrismaClient | undefined;
+  tracingPrismaGlobal: PrismaClient | undefined;
   kyselyPrismaGlobal: { $kysely: Kysely<DB> } | undefined;
 } & typeof global;
 
 // eslint-disable-next-line turbo/no-undeclared-env-vars
 if (process.env.NODE_ENV === "development") {
   globalThis.prismaGlobal ??= createPrismaInstance(); // regular instantiation
+  globalThis.tracingPrismaGlobal ??= createPrismaInstance({
+    url: process.env.TRACING_DATABASE_URL, // eslint-disable-line turbo/no-undeclared-env-vars
+  });
   globalThis.kyselyPrismaGlobal ??= globalThis.prismaGlobal.$extends(
     kyselyExtension({
       kysely: (driver) =>
@@ -110,6 +132,8 @@ if (process.env.NODE_ENV === "development") {
 
 export const prisma =
   globalThis.prismaGlobal ?? PrismaClientSingleton.getInstance();
+export const tracingPrisma =
+  globalThis.tracingPrismaGlobal ?? PrismaTracingClientSingleton.getInstance();
 export const kyselyPrisma =
   globalThis.kyselyPrismaGlobal ?? KyselySingleton.getInstance();
 

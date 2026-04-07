@@ -16,20 +16,20 @@ import {
 import {
   ChevronDownIcon,
   LoaderCircle,
-  PlusIcon,
-  Settings,
+  // PlusIcon,
+  // Settings,
   Slash,
 } from "lucide-react";
-import { Button } from "@/src/components/ui/button";
+// import { Button } from "@/src/components/ui/button";
 import { env } from "@/src/env.mjs";
 import { useQueryProjectOrOrganization } from "@/src/features/projects/hooks";
 import { useRouter } from "next/router";
 import { useSession } from "next-auth/react";
-import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
-import {
-  createOrganizationRoute,
-  createProjectRoute,
-} from "@/src/features/setup/setupRoutes";
+// import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
+// import {
+//   createOrganizationRoute,
+//   createProjectRoute,
+// } from "@/src/features/setup/setupRoutes";
 import { isCloudPlan, planLabels } from "@langfuse/shared";
 import Link from "next/link";
 import { Badge } from "@/src/components/ui/badge";
@@ -53,11 +53,12 @@ const BreadcrumbComponent = ({
 
   const organizations = session.data?.user?.organizations;
 
-  const canCreateOrganizations = session.data?.user?.canCreateOrganizations;
-  const canCreateProjects = useHasOrganizationAccess({
-    organizationId: organization?.id,
-    scope: "projects:create",
-  });
+  // Hidden in Meko embed: disable creation actions.
+  // const canCreateOrganizations = session.data?.user?.canCreateOrganizations;
+  // const canCreateProjects = useHasOrganizationAccess({
+  //   organizationId: organization?.id,
+  //   scope: "projects:create",
+  // });
 
   /**
    * Truncate the path before the first dynamic segment that is not allowlisted.
@@ -111,12 +112,13 @@ const BreadcrumbComponent = ({
               <ChevronDownIcon className="h-4 w-4" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start">
-              <DropdownMenuItem className="font-semibold" asChild>
+              {/* Hidden in Meko embed: back to organizations list */}
+              {/* <DropdownMenuItem className="font-semibold" asChild>
                 <Link href="/" className="cursor-pointer">
                   Organizations
                 </Link>
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
+              <DropdownMenuSeparator /> */}
               <div className="max-h-36 overflow-y-auto">
                 {organizations ? (
                   organizations
@@ -144,7 +146,8 @@ const BreadcrumbComponent = ({
                             >
                               {dropdownOrg.name}
                             </span>
-                            <Button
+                            {/* Hidden in Meko embed: org settings quick action */}
+                            {/* <Button
                               asChild
                               variant="ghost"
                               size="xs"
@@ -161,7 +164,7 @@ const BreadcrumbComponent = ({
                               >
                                 <Settings size={12} />
                               </div>
-                            </Button>
+                            </Button> */}
                           </Link>
                         </DropdownMenuItem>
                       </Fragment>
@@ -171,7 +174,8 @@ const BreadcrumbComponent = ({
                 )}
               </div>
 
-              {canCreateOrganizations && (
+              {/* Hidden in Meko embed: organization creation */}
+              {/* {canCreateOrganizations && (
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem asChild>
@@ -191,7 +195,7 @@ const BreadcrumbComponent = ({
                     </Button>
                   </DropdownMenuItem>
                 </>
-              )}
+              )} */}
             </DropdownMenuContent>
           </DropdownMenu>
         )}
@@ -206,7 +210,8 @@ const BreadcrumbComponent = ({
                 <ChevronDownIcon className="h-4 w-4" />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start">
-                <DropdownMenuItem asChild className="font-semibold">
+                {/* Hidden in Meko embed: back to projects list */}
+                {/* <DropdownMenuItem asChild className="font-semibold">
                   <Link
                     href={`/organization/${organization.id}`}
                     className="cursor-pointer"
@@ -214,7 +219,7 @@ const BreadcrumbComponent = ({
                     Projects
                   </Link>
                 </DropdownMenuItem>
-                <DropdownMenuSeparator />
+                <DropdownMenuSeparator /> */}
                 <div className="max-h-36 overflow-y-auto">
                   {organizations ? (
                     organizations
@@ -231,7 +236,8 @@ const BreadcrumbComponent = ({
                             >
                               {dropdownProject.name}
                             </span>
-                            <Button
+                            {/* Hidden in Meko embed: project settings quick action */}
+                            {/* <Button
                               asChild
                               variant="ghost"
                               size="xs"
@@ -248,7 +254,7 @@ const BreadcrumbComponent = ({
                               >
                                 <Settings size={12} />
                               </div>
-                            </Button>
+                            </Button> */}
                           </Link>
                         </DropdownMenuItem>
                       ))
@@ -257,7 +263,8 @@ const BreadcrumbComponent = ({
                   )}
                 </div>
 
-                {canCreateProjects && (
+                {/* Hidden in Meko embed: project creation */}
+                {/* {canCreateProjects && (
                   <>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem asChild>
@@ -277,7 +284,7 @@ const BreadcrumbComponent = ({
                       </Button>
                     </DropdownMenuItem>
                   </>
-                )}
+                )} */}
               </DropdownMenuContent>
             </DropdownMenu>
           </>

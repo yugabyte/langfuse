@@ -49,6 +49,9 @@ import {
   convertDefinitionsToMap,
   convertCallsToArrays,
   hasNoEvalConfigsCache,
+  upsertTrace,
+  upsertObservation,
+  upsertScore,
 } from "@langfuse/shared/src/server";
 
 import { tokenCountAsync } from "../../features/tokenisation/async-usage";
@@ -664,6 +667,7 @@ export class IngestionService {
     finalScoreRecord.created_at =
       clickhouseScoreRecord?.created_at ?? createdAtTimestamp.getTime();
 
+    await upsertScore(finalScoreRecord as any);
     this.clickHouseWriter.addToQueue(TableName.Scores, finalScoreRecord);
   }
 
@@ -742,6 +746,7 @@ export class IngestionService {
     finalTraceRecord.input = finalIO.input ?? clickhouseTraceRecord?.input;
     finalTraceRecord.output = finalIO.output ?? clickhouseTraceRecord?.output;
 
+    await upsertTrace(finalTraceRecord as any);
     this.clickHouseWriter.addToQueue(TableName.Traces, finalTraceRecord);
 
     // If the trace has a sessionId, we upsert the corresponding session into Postgres.
@@ -931,6 +936,21 @@ export class IngestionService {
       ...generationUsage,
     };
 
+    logger.info("Observation Postgres payload", {
+      projectId,
+      observationId: finalObservationRecord.id,
+      traceId: finalObservationRecord.trace_id,
+      type: finalObservationRecord.type,
+      level: finalObservationRecord.level,
+      providedModelName: finalObservationRecord.provided_model_name ?? null,
+      internalModelId: finalObservationRecord.internal_model_id ?? null,
+      providedUsageDetails: finalObservationRecord.provided_usage_details ?? {},
+      usageDetails: finalObservationRecord.usage_details ?? {},
+      providedCostDetails: finalObservationRecord.provided_cost_details ?? {},
+      costDetails: finalObservationRecord.cost_details ?? {},
+      totalCost: finalObservationRecord.total_cost ?? null,
+    });
+
     // Backward compat: create wrapper trace for SDK < 2.0.0 events that do not have a traceId
     if (!finalObservationRecord.trace_id) {
       const wrapperTraceRecord: TraceRecordInsertType = {
@@ -948,10 +968,12 @@ export class IngestionService {
         is_deleted: 0,
       };
 
+      await upsertTrace(wrapperTraceRecord as any);
       this.clickHouseWriter.addToQueue(TableName.Traces, wrapperTraceRecord);
       finalObservationRecord.trace_id = finalObservationRecord.id;
     }
 
+    await upsertObservation(finalObservationRecord as any);
     this.clickHouseWriter.addToQueue(
       TableName.Observations,
       finalObservationRecord,
@@ -1214,6 +1236,20 @@ export class IngestionService {
       },
     );
 
+    if (
+      Object.keys(final_usage_details.usage_details ?? {}).length === 0 &&
+      Object.keys(final_cost_details.cost_details ?? {}).length === 0
+    ) {
+      logger.warn("Observation usage/cost empty after enrichment", {
+        projectId,
+        observationId: observationRecord.id,
+        providedModelName: observationRecord.provided_model_name ?? null,
+        resolvedModelId: internalModel?.id ?? null,
+        providedUsageDetails: observationRecord.provided_usage_details ?? {},
+        providedCostDetails: observationRecord.provided_cost_details ?? {},
+      });
+    }
+
     return {
       ...final_usage_details,
       ...final_cost_details,
@@ -1474,6 +1510,14 @@ export class IngestionService {
       params: Record<string, unknown>;
     };
   }) {
+    if (this.clickHouseWriter.isDisabled()) {
+      recordIncrement("langfuse.ingestion.clickhouse_read_for_update", 1, {
+        skipped: "true",
+        table: params.table,
+      });
+      return null;
+    }
+
     if (
       await ClickhouseReadSkipCache.getInstance(
         this.prisma,

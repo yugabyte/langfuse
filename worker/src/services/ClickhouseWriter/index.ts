@@ -30,11 +30,13 @@ export class ClickhouseWriter {
 
   isIntervalFlushInProgress: boolean;
   intervalId: NodeJS.Timeout | null = null;
+  private readonly writesDisabled: boolean;
 
   private constructor() {
     this.batchSize = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE;
     this.writeInterval = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS;
     this.maxAttempts = env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS;
+    this.writesDisabled = env.LANGFUSE_DISABLE_CLICKHOUSE_WRITES === "true";
 
     this.isIntervalFlushInProgress = false;
 
@@ -48,6 +50,13 @@ export class ClickhouseWriter {
       [TableName.DatasetRunItems]: [],
       [TableName.Events]: [],
     };
+
+    if (this.writesDisabled) {
+      logger.warn(
+        "ClickhouseWriter is disabled via LANGFUSE_DISABLE_CLICKHOUSE_WRITES=true. Records will not be written to ClickHouse.",
+      );
+      return;
+    }
 
     this.start();
   }
@@ -97,6 +106,10 @@ export class ClickhouseWriter {
     await this.flushAll(true);
 
     logger.info("ClickhouseWriter shutdown complete.");
+  }
+
+  public isDisabled() {
+    return this.writesDisabled;
   }
 
   private async flushAll(fullQueue = false) {
@@ -443,6 +456,10 @@ export class ClickhouseWriter {
     tableName: T,
     data: RecordInsertType<T>,
   ) {
+    if (this.writesDisabled) {
+      return;
+    }
+
     const entityQueue = this.queue[tableName];
     entityQueue.push({
       createdAt: Date.now(),

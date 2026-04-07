@@ -10,9 +10,7 @@ import { LangfuseNotFoundError } from "@langfuse/shared";
 import {
   enrichObservationWithModelData,
   getObservationById,
-  getObservationByIdFromEventsTable,
 } from "@langfuse/shared/src/server";
-import { env } from "@/src/env.mjs";
 
 export default withMiddlewares({
   GET: createAuthedProjectAPIRoute({
@@ -20,24 +18,14 @@ export default withMiddlewares({
     querySchema: GetObservationV1Query,
     responseSchema: GetObservationV1Response,
     fn: async ({ query, auth }) => {
-      // Use events table if query parameter is explicitly set, otherwise use environment variable
-      const useEventsTable =
-        query.useEventsTable !== undefined && query.useEventsTable !== null
-          ? query.useEventsTable === true
-          : env.LANGFUSE_ENABLE_EVENTS_TABLE_OBSERVATIONS;
-
-      const clickhouseObservation = useEventsTable
-        ? await getObservationByIdFromEventsTable({
-            id: query.observationId,
-            projectId: auth.scope.projectId,
-            fetchWithInputOutput: true,
-          })
-        : await getObservationById({
-            id: query.observationId,
-            projectId: auth.scope.projectId,
-            fetchWithInputOutput: true,
-            preferredClickhouseService: "ReadOnly",
-          });
+      // Public observations use the PostgreSQL tracing backend in this fork.
+      // Keep accepting `useEventsTable` for API compatibility, but ignore it.
+      const clickhouseObservation = await getObservationById({
+        id: query.observationId,
+        projectId: auth.scope.projectId,
+        fetchWithInputOutput: true,
+        preferredClickhouseService: "ReadOnly",
+      });
 
       if (!clickhouseObservation) {
         throw new LangfuseNotFoundError(

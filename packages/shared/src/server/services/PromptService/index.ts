@@ -160,9 +160,7 @@ export class PromptService {
     }
   }
 
-  public async invalidateCache(
-    params: Pick<PromptParams, "projectId">,
-  ): Promise<void> {
+  public async invalidateCache(params: { projectId: string }): Promise<void> {
     if (!this.cacheEnabled) return;
 
     // Rotate the epoch token to move all prompt reads/writes to a fresh namespace.
@@ -191,7 +189,7 @@ export class PromptService {
     return `prompt:${params.projectId}:${epoch}:${params.promptName}`;
   }
 
-  private getEpochKey(params: Pick<PromptParams, "projectId">): string {
+  private getEpochKey(params: { projectId: string }): string {
     // Important: epoch is project-scoped (not prompt-scoped) because resolved prompts
     // can include transitive dependencies across multiple prompt names.
     return `prompt_cache_epoch:${params.projectId}`;
@@ -202,9 +200,9 @@ export class PromptService {
     return randomBytes(6).toString("base64url");
   }
 
-  private async getOrCreateEpoch(
-    params: Pick<PromptParams, "projectId">,
-  ): Promise<string | null> {
+  private async getOrCreateEpoch(params: {
+    projectId: string;
+  }): Promise<string | null> {
     const epochKey = this.getEpochKey(params);
 
     const currentEpoch = await this.redis?.get(epochKey);

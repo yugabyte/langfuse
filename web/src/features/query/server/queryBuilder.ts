@@ -19,7 +19,6 @@ import { getViewDeclaration } from "@/src/features/query/dataModel";
 import {
   FilterList,
   createFilterFromFilterState,
-  type Filter,
 } from "@langfuse/shared/src/server";
 import { InvalidRequestError } from "@langfuse/shared";
 import { env } from "@/src/env.mjs";
@@ -48,7 +47,7 @@ type AppliedMetricType = {
 type RawSqlPart = { query: string; params: Record<string, unknown> };
 
 type MappedFilters = {
-  whereFilters: Filter[];
+  whereFilters: ConstructorParameters<typeof FilterList>[0];
   whereRawParts: RawSqlPart[];
 };
 

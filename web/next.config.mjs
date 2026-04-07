@@ -6,6 +6,10 @@ await import("./src/env.mjs");
 import { withSentryConfig } from "@sentry/nextjs";
 import { env } from "./src/env.mjs";
 import bundleAnalyzer from "@next/bundle-analyzer";
+import {
+  TRACING_ONLY_REDIRECTS,
+  REDIRECT_PROJECT_SEGMENTS,
+} from "./src/config/routing.mjs";
 
 /**
  * CSP headers
@@ -22,7 +26,7 @@ const cspHeader = `
   object-src 'none';
   base-uri 'self';
   form-action 'self' https://login.microsoftonline.com https://login.microsoft.com https://*.microsoftonline.com;
-  frame-ancestors 'none';
+  frame-ancestors 'self';
   connect-src 'self' https://*.langfuse.com https://*.langfuse.dev https://*.ingest.us.sentry.io https://*.sentry.io https://chat.uk.plain.com https://*.s3.amazonaws.com https://prod-uk-services-attachm-attachmentsuploadbucket2-1l2e4906o2asm.s3.eu-west-2.amazonaws.com https://login.microsoftonline.com https://login.microsoft.com https://*.microsoftonline.com https://graph.microsoft.com;
   media-src 'self' https: http://localhost:*;
   ${env.LANGFUSE_CSP_ENFORCE_HTTPS === "true" ? "upgrade-insecure-requests; block-all-mixed-content;" : ""}
@@ -186,6 +190,24 @@ const nextConfig = {
         ],
       },
     ];
+  },
+
+  async redirects() {
+    if (!TRACING_ONLY_REDIRECTS) return [];
+    const basePath = env.NEXT_PUBLIC_BASE_PATH || "";
+    const prefix = basePath ? `${basePath.replace(/\/$/, "")}` : "";
+    return REDIRECT_PROJECT_SEGMENTS.flatMap((segment) => [
+      {
+        source: `${prefix}/project/:projectId/${segment}`,
+        destination: `${prefix}/project/:projectId/traces`,
+        permanent: false,
+      },
+      {
+        source: `${prefix}/project/:projectId/${segment}/:path*`,
+        destination: `${prefix}/project/:projectId/traces`,
+        permanent: false,
+      },
+    ]);
   },
 
   webpack(config, { isServer }) {

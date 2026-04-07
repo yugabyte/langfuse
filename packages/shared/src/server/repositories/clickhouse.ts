@@ -522,7 +522,10 @@ export async function commandClickhouse(opts: {
   );
 }
 
-export function parseClickhouseUTCDateTimeFormat(dateStr: string): Date {
+export function parseClickhouseUTCDateTimeFormat(dateStr: string | Date): Date {
+  if (dateStr instanceof Date) {
+    return dateStr;
+  }
   return new Date(`${dateStr.replace(" ", "T")}Z`);
 }
 

@@ -103,6 +103,12 @@ export const TraceGraphCanvas: React.FC<TraceGraphCanvasProps> = (props) => {
           background: "#f3f4f6", // gray-100
           highlight: { border: "#9ca3af", background: "#e5e7eb" }, // gray-200
         };
+      case "PgDistRagRetriever":
+        return {
+          border: "#38bdf8", // sky-400
+          background: "#e0f2fe", // sky-100
+          highlight: { border: "#0ea5e9", background: "#bae6fd" }, // sky-500 / sky-200
+        };
       default:
         return {
           border: "#93c5fd", // blue-300 (former background)
@@ -184,7 +190,7 @@ export const TraceGraphCanvas: React.FC<TraceGraphCanvasProps> = (props) => {
         },
       },
       interaction: {
-        zoomView: false,
+        zoomView: true,
       },
       nodes: {
         shape: "box",
@@ -444,7 +450,7 @@ export const TraceGraphCanvas: React.FC<TraceGraphCanvasProps> = (props) => {
 
   return (
     <div
-      className="relative h-full min-h-[50dvh] w-full pb-2"
+      className="relative h-full w-full pb-2"
       onMouseEnter={() => setIsHovering(true)}
       onMouseLeave={() => setIsHovering(false)}
     >
