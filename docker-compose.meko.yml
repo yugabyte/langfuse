@@ -1,9 +1,14 @@
 services:
   # Langfuse-only override for Meko integration.
+  # Prebuilt ECR images may omit NEXT_PUBLIC_BASE_PATH; for Meko Observe use docker-compose.yml build
+  # with NEXT_PUBLIC_BASE_PATH=/observe (see that file), or publish images with the same build-arg.
   # Keeps the base stack intact while disabling hardcoded init bootstrap.
   langfuse-web:
     ports: []
     environment:
+      # Keep Meko override local-first.
+      NEXTAUTH_URL: "http://localhost:5000/observe"
+      LANGFUSE_AI_FEATURES_HOST: "http://localhost:3000"
       LANGFUSE_INIT_ORG_ID: ""
       LANGFUSE_INIT_ORG_NAME: ""
       LANGFUSE_INIT_PROJECT_ID: ""
@@ -13,3 +18,8 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ""
       LANGFUSE_INIT_USER_NAME: ""
       LANGFUSE_INIT_USER_PASSWORD: ""
+
+  langfuse-worker:
+    environment:
+      NEXTAUTH_URL: "http://localhost:5000/observe"
+      LANGFUSE_AI_FEATURES_HOST: "http://localhost:3000"

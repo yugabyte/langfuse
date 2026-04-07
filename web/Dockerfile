@@ -92,6 +92,8 @@ ENV NEXT_TELEMETRY_DISABLED 1
 ENV NEXT_MANUAL_SIG_HANDLE true
 # set the CI flag to true to get CI specific logs
 ENV CI true
+# Force default Next output dir so runner COPY paths stay stable.
+ENV NEXT_DIST_DIR .next
 
 RUN sh -c ' \
   start_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
